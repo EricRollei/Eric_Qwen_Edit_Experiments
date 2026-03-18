@@ -41,6 +41,21 @@ These nodes use a custom pipeline that:
 | 6 MP  | 1 MP output      | 6 MP output                |
 | 20 MP | 1 MP output      | 16 MP output (capped)      |
 
+### Automatic Sigma Scheduling (No "Aura Flow Shift" Needed)
+
+Many Qwen-Image workflows in ComfyUI use a **ModelSamplingAuraFlow** (or "Aura Flow Shift") node in the model path. That node exists because ComfyUI's native UNET → KSampler approach treats the model, scheduler, and sampler as separate graph nodes — users have to manually configure the **sigma time-shift** that flow-matching models need to produce good results. Without it the sigma schedule is unshifted and the model produces washed-out or burned images.
+
+These nodes use the **Hugging Face diffusers pipeline** directly, which handles sigma scheduling automatically:
+
+| Aspect | ComfyUI native (UNET + KSampler) | Eric Qwen-Edit / Qwen-Image (diffusers) |
+|--------|-----------------------------------|------------------------------------------|
+| Sigma shifting | Manual — requires an extra "Aura Flow Shift" node with a user-chosen shift value | Automatic — `FlowMatchEulerDiscreteScheduler` with `use_dynamic_shifting` reads the correct parameters from the model config |
+| Resolution-aware | No — fixed shift regardless of output size | Yes — time-shift mu is interpolated from the output resolution's latent sequence length |
+| Shift formula | `α·t / (1 + (α-1)·t)` with a single hand-tuned α | Exponential: `exp(μ) / (exp(μ) + (1/t - 1))` + terminal stretch, where μ adapts per resolution |
+| Configuration | User must wire the node and pick values | Zero-config — parameters come from `scheduler_config.json` shipped with the model |
+
+In short, the diffusers scheduler already performs a more sophisticated, resolution-adaptive version of what the Aura Flow Shift node does manually. **You do not need any extra shift nodes with these nodes.**
+
 ## Installation
 
 ### Option 1: ComfyUI Manager
