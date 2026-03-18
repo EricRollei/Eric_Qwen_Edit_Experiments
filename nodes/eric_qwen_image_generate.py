@@ -24,39 +24,44 @@ from .eric_qwen_edit_utils import pil_to_tensor
 
 # ── Resolution helpers ──────────────────────────────────────────────────
 
-DIMENSION_ALIGNMENT = 32  # Must be divisible by 32 for VAE packing
+DIMENSION_ALIGNMENT = 16  # Qwen requires dimensions divisible by 16
 
-# Pre-built presets: (label, width, height)
-RESOLUTION_PRESETS = {
-    "1024×1024 (1:1)":    (1024, 1024),
-    "1152×896 (9:7)":     (1152, 896),
-    "896×1152 (7:9)":     (896, 1152),
-    "1216×832 (19:13)":   (1216, 832),
-    "832×1216 (13:19)":   (832, 1216),
-    "1344×768 (7:4)":     (1344, 768),
-    "768×1344 (4:7)":     (768, 1344),
-    "1536×640 (12:5)":    (1536, 640),
-    "640×1536 (5:12)":    (640, 1536),
-    "custom":             (0, 0),
+# Aspect ratios: label → (width_ratio, height_ratio)
+ASPECT_RATIOS = {
+    "1:1":   (1, 1),
+    "3:2":   (3, 2),
+    "2:3":   (2, 3),
+    "4:3":   (4, 3),
+    "3:4":   (3, 4),
+    "5:4":   (5, 4),
+    "4:5":   (4, 5),
+    "7:5":   (7, 5),
+    "5:7":   (5, 7),
+    "16:9":  (16, 9),
+    "9:16":  (9, 16),
 }
 
 
 def _align(val: int) -> int:
-    """Align to DIMENSION_ALIGNMENT."""
+    """Round down to nearest multiple of DIMENSION_ALIGNMENT (min 16)."""
     return max(DIMENSION_ALIGNMENT, (val // DIMENSION_ALIGNMENT) * DIMENSION_ALIGNMENT)
 
 
-def compute_dimensions(
-    width: int, height: int, max_mp: float
+def compute_dimensions_from_ratio(
+    w_ratio: int, h_ratio: int, target_mp: float
 ) -> Tuple[int, int]:
-    """Scale dimensions down if they exceed max_mp, preserving aspect ratio."""
-    max_pixels = int(max_mp * 1024 * 1024)
-    current_pixels = width * height
-    if current_pixels > max_pixels:
-        scale = math.sqrt(max_pixels / current_pixels)
-        width = int(width * scale)
-        height = int(height * scale)
-    return _align(width), _align(height)
+    """Compute width and height from aspect ratio and megapixel target.
+
+    Solves for the dimensions that match the given aspect ratio while
+    hitting the target megapixel count as closely as possible, then
+    aligns both axes to ``DIMENSION_ALIGNMENT`` (16 px).
+    """
+    target_pixels = target_mp * 1_000_000
+    # w/h = w_ratio/h_ratio  =>  w = h * (w_ratio/h_ratio)
+    # w * h = target_pixels   =>  h^2 * (w_ratio/h_ratio) = target_pixels
+    h = math.sqrt(target_pixels * h_ratio / w_ratio)
+    w = h * w_ratio / h_ratio
+    return _align(int(round(w))), _align(int(round(h)))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -67,10 +72,11 @@ class EricQwenImageGenerate:
     """
     Generate images from text using Qwen-Image / Qwen-Image-2512.
 
-    Choose a resolution preset or set custom width/height.  Resolution is
-    capped by max_mp and aligned to 32 px.  A ComfyUI progress bar tracks
-    the denoising steps.  Spectrum acceleration is supported when a
-    _spectrum_config is attached to the pipeline.
+    Pick an aspect ratio and a megapixel target — the node computes
+    the exact pixel dimensions (aligned to 16 px as Qwen requires).
+    A ComfyUI progress bar tracks the denoising steps.  Spectrum
+    acceleration is supported when a _spectrum_config is attached to
+    the pipeline.
     """
 
     CATEGORY = "Eric Qwen-Image"
@@ -80,7 +86,7 @@ class EricQwenImageGenerate:
 
     @classmethod
     def INPUT_TYPES(cls):
-        preset_names = list(RESOLUTION_PRESETS.keys())
+        ratio_names = list(ASPECT_RATIOS.keys())
         return {
             "required": {
                 "pipeline": ("QWEN_IMAGE_PIPELINE", {
@@ -97,23 +103,16 @@ class EricQwenImageGenerate:
                     "default": "",
                     "tooltip": "What to avoid in the output"
                 }),
-                "resolution": (preset_names, {
-                    "default": "1024×1024 (1:1)",
-                    "tooltip": "Resolution preset. Choose 'custom' to use width/height below."
+                "aspect_ratio": (ratio_names, {
+                    "default": "1:1",
+                    "tooltip": "Aspect ratio of the generated image"
                 }),
-                "width": ("INT", {
-                    "default": 1024,
-                    "min": 256,
-                    "max": 4096,
-                    "step": 32,
-                    "tooltip": "Custom width (only used when resolution = 'custom')"
-                }),
-                "height": ("INT", {
-                    "default": 1024,
-                    "min": 256,
-                    "max": 4096,
-                    "step": 32,
-                    "tooltip": "Custom height (only used when resolution = 'custom')"
+                "target_mp": ("FLOAT", {
+                    "default": 4.0,
+                    "min": 0.25,
+                    "max": 16.0,
+                    "step": 0.25,
+                    "tooltip": "Target megapixels — the node computes exact width/height from ratio + MP (dimensions aligned to 16 px)"
                 }),
                 "steps": ("INT", {
                     "default": 50,
@@ -135,13 +134,6 @@ class EricQwenImageGenerate:
                     "max": 0xffffffffffffffff,
                     "tooltip": "Random seed (0 = random)"
                 }),
-                "max_mp": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.25,
-                    "max": 16.0,
-                    "step": 0.25,
-                    "tooltip": "Maximum output megapixels (for VRAM safety)"
-                }),
             }
         }
 
@@ -150,25 +142,21 @@ class EricQwenImageGenerate:
         pipeline: dict,
         prompt: str,
         negative_prompt: str = "",
-        resolution: str = "1024×1024 (1:1)",
-        width: int = 1024,
-        height: int = 1024,
+        aspect_ratio: str = "1:1",
+        target_mp: float = 4.0,
         steps: int = 50,
         true_cfg_scale: float = 4.0,
         seed: int = 0,
-        max_mp: float = 1.0,
     ) -> Tuple[torch.Tensor]:
         pipe = pipeline["pipeline"]
         offload_vae = pipeline.get("offload_vae", False)
 
-        # ── Resolve resolution ──────────────────────────────────────────
-        if resolution != "custom":
-            preset = RESOLUTION_PRESETS.get(resolution, (1024, 1024))
-            width, height = preset
-        width, height = compute_dimensions(width, height, max_mp)
+        # ── Compute dimensions from ratio + megapixel target ────────────
+        w_ratio, h_ratio = ASPECT_RATIOS.get(aspect_ratio, (1, 1))
+        width, height = compute_dimensions_from_ratio(w_ratio, h_ratio, target_mp)
 
         print(f"[EricQwenImage] Generating {width}×{height} ({width * height / 1e6:.2f} MP), "
-              f"steps={steps}, cfg={true_cfg_scale}")
+              f"ratio={aspect_ratio}, steps={steps}, cfg={true_cfg_scale}")
 
         # ── Generator ───────────────────────────────────────────────────
         device = pipe._execution_device if hasattr(pipe, "_execution_device") else "cuda"
