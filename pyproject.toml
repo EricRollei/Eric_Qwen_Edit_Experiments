@@ -1,0 +1,31 @@
+[project]
+name = "comfyui-eric-qwen-edit"
+version = "1.0.0"
+description = "ComfyUI nodes for Qwen-Image-Edit and Qwen-Image with smart resolution handling"
+readme = "README.md"
+license = { file = "LICENSE.txt" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Eric Hiss", email = "eric@historic.camera" }
+]
+maintainers = [
+    { name = "Eric Hiss", email = "eric@historic.camera" }
+]
+dependencies = [
+    "torch>=2.0.0",
+    "diffusers>=0.30.0",
+    "transformers>=4.40.0",
+    "accelerate",
+    "safetensors",
+    "pillow",
+    "numpy",
+]
+
+[project.urls]
+Repository = "https://github.com/EricRollei/Eric_Qwen_Edit_Experiments"
+Issues = "https://github.com/EricRollei/Eric_Qwen_Edit_Experiments/issues"
+
+[tool.comfy]
+PublisherId = "ericrollei"
+DisplayName = "Eric Qwen-Edit & Qwen-Image Nodes"
+Icon = ""

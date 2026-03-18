@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+.history/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS artifacts
+Thumbs.db
+.DS_Store
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.venv/
+
+# Logs
+*.log
+
+# Private examples
+examples/not public/
