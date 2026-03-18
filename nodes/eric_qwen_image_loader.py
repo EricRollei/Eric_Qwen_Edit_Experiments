@@ -92,6 +92,14 @@ class EricQwenImageLoader:
     RETURN_NAMES = ("pipeline",)
 
     @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Force re-evaluation when the cache has been cleared by Unload
+        cache = get_gen_pipeline_cache()
+        if cache["pipeline"] is None:
+            return float("nan")
+        return cache.get("cache_key", "")
+
+    @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {

@@ -3,15 +3,14 @@
 # https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Eric Qwen-Image Multi-Stage Generate Node
-Progressive multi-stage text-to-image generation.
+Progressive multi-stage text-to-image generation with full per-stage control.
 
-Stage 1 — Draft:  0.5 MP, 2× user CFG, 15 steps (txt2img from noise)
-Stage 2 — Refine: 2 MP,   user CFG,     remaining steps (upscaled latent)
-Stage 3 — Final:  target,  0.5× user CFG, remaining steps (if target > 2 MP)
+Up to 3 stages with independent steps, CFG, and upscale ratios.
+Set upscale_to_stage2 = 0 to output Stage 1 only (single-stage).
+Set upscale_to_stage3 = 0 to stop after Stage 2 (two-stage).
 
-Latents are upscaled 2× each dimension between stages (4× area) and
-partially re-noised according to per-stage denoise strength before
-re-sampling.  Total step budget = user steps input.
+Latents are upscaled between stages via bicubic interpolation and
+re-noised according to per-stage denoise strength before re-sampling.
 
 Model Credits:
 - Qwen-Image developed by Qwen Team (Alibaba)
@@ -65,9 +64,8 @@ def _upscale_latents(latents_packed: torch.Tensor,
                      src_h: int, src_w: int,
                      dst_h: int, dst_w: int,
                      vae_scale_factor: int) -> torch.Tensor:
-    """Unpack → bicubic upscale → repack latents."""
+    """Unpack -> bicubic upscale -> repack latents."""
     spatial = _unpack_latents(latents_packed, src_h, src_w, vae_scale_factor)
-    # spatial shape: (B, C, 1, H_lat, W_lat)
     b, c, _one, h_lat, w_lat = spatial.shape
     dst_h_lat = 2 * (int(dst_h) // (vae_scale_factor * 2))
     dst_w_lat = 2 * (int(dst_w) // (vae_scale_factor * 2))
@@ -85,23 +83,23 @@ def _add_noise_flowmatch(latents: torch.Tensor, noise: torch.Tensor,
     return (1.0 - sigma) * latents + sigma * noise
 
 
+def _check_cancelled():
+    """Raise InterruptProcessingException if user hit Cancel in ComfyUI."""
+    import comfy.model_management
+    comfy.model_management.throw_exception_if_processing_interrupted()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Multi-Stage Generation Node
 # ═══════════════════════════════════════════════════════════════════════
 
 class EricQwenImageMultiStage:
     """
-    Progressive multi-stage text-to-image generation.
+    Progressive multi-stage text-to-image generation with full per-stage
+    control over steps, CFG, initial MP, upscale ratios, and denoise.
 
-    Generates a small draft (0.5 MP), then upscales the latent and
-    refines at 2 MP, and optionally a third stage at the final target
-    resolution.  This can produce higher quality results than a single
-    pass at full resolution, especially for large images.
-
-    Step budget: Stage 1 always uses 15 steps.  The remainder is split
-    between Stage 2 (and Stage 3 if needed).
-
-    CFG schedule: Stage 1 = 2× input, Stage 2 = input, Stage 3 = 0.5× input.
+    - Set upscale_to_stage2 = 0 to output Stage 1 only (single-stage).
+    - Set upscale_to_stage3 = 0 to stop after Stage 2 (two-stage).
     """
 
     CATEGORY = "Eric Qwen-Image"
@@ -130,28 +128,7 @@ class EricQwenImageMultiStage:
                 }),
                 "aspect_ratio": (ratio_names, {
                     "default": "1:1   Square",
-                    "tooltip": "Aspect ratio of the generated image"
-                }),
-                "target_mp": ("FLOAT", {
-                    "default": 4.0,
-                    "min": 2.0,
-                    "max": 16.0,
-                    "step": 0.25,
-                    "tooltip": "Final output megapixels (minimum 2 MP, 3+ stages if > 2 MP)"
-                }),
-                "steps": ("INT", {
-                    "default": 50,
-                    "min": 20,
-                    "max": 200,
-                    "step": 1,
-                    "tooltip": "Total inference steps — 15 for Stage 1, remainder split across later stages"
-                }),
-                "true_cfg_scale": ("FLOAT", {
-                    "default": 4.0,
-                    "min": 1.0,
-                    "max": 20.0,
-                    "step": 0.5,
-                    "tooltip": "Base CFG — Stage 1 uses 2×, Stage 2 uses 1×, Stage 3 uses 0.5×"
+                    "tooltip": "Aspect ratio applied at every stage"
                 }),
                 "seed": ("INT", {
                     "default": 0,
@@ -159,19 +136,85 @@ class EricQwenImageMultiStage:
                     "max": 0xffffffffffffffff,
                     "tooltip": "Random seed (0 = random)"
                 }),
-                "stage2_denoise": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.1,
-                    "max": 1.0,
-                    "step": 0.05,
-                    "tooltip": "Denoise strength for Stage 2 (1.0 = full re-denoise, lower = preserve more detail from previous stage)"
+                # ── Stage 1 ─────────────────────────────────────────────
+                "s1_mp": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.3,
+                    "max": 2.0,
+                    "step": 0.1,
+                    "tooltip": "Stage 1 initial resolution in megapixels"
                 }),
-                "stage3_denoise": ("FLOAT", {
+                "s1_steps": ("INT", {
+                    "default": 15,
+                    "min": 1,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Stage 1 inference steps (txt2img from noise)"
+                }),
+                "s1_cfg": ("FLOAT", {
+                    "default": 8.0,
+                    "min": 1.0,
+                    "max": 20.0,
+                    "step": 0.5,
+                    "tooltip": "Stage 1 true CFG scale"
+                }),
+                # ── Stage 2 ─────────────────────────────────────────────
+                "upscale_to_stage2": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 0.0,
+                    "max": 8.0,
+                    "step": 0.5,
+                    "tooltip": "Upscale factor (area) from Stage 1 to Stage 2 (0 = skip Stage 2 & 3, output Stage 1)"
+                }),
+                "s2_steps": ("INT", {
+                    "default": 20,
+                    "min": 1,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Stage 2 inference steps"
+                }),
+                "s2_cfg": ("FLOAT", {
+                    "default": 4.0,
+                    "min": 1.0,
+                    "max": 20.0,
+                    "step": 0.5,
+                    "tooltip": "Stage 2 true CFG scale"
+                }),
+                "s2_denoise": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.1,
                     "max": 1.0,
                     "step": 0.05,
-                    "tooltip": "Denoise strength for Stage 3 (1.0 = full re-denoise, lower = preserve more detail from previous stage)"
+                    "tooltip": "Stage 2 denoise (1.0 = full re-denoise, lower = preserve prior stage detail)"
+                }),
+                # ── Stage 3 ─────────────────────────────────────────────
+                "upscale_to_stage3": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 0.0,
+                    "max": 8.0,
+                    "step": 0.5,
+                    "tooltip": "Upscale factor (area) from Stage 2 to Stage 3 (0 = skip Stage 3, output Stage 2)"
+                }),
+                "s3_steps": ("INT", {
+                    "default": 15,
+                    "min": 1,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Stage 3 inference steps"
+                }),
+                "s3_cfg": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 1.0,
+                    "max": 20.0,
+                    "step": 0.5,
+                    "tooltip": "Stage 3 true CFG scale"
+                }),
+                "s3_denoise": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.1,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Stage 3 denoise (1.0 = full re-denoise, lower = preserve prior stage detail)"
                 }),
             }
         }
@@ -186,55 +229,66 @@ class EricQwenImageMultiStage:
         prompt: str,
         negative_prompt: str = "",
         aspect_ratio: str = "1:1   Square",
-        target_mp: float = 4.0,
-        steps: int = 50,
-        true_cfg_scale: float = 4.0,
         seed: int = 0,
-        stage2_denoise: float = 1.0,
-        stage3_denoise: float = 1.0,
+        # Stage 1
+        s1_mp: float = 0.5,
+        s1_steps: int = 15,
+        s1_cfg: float = 8.0,
+        # Stage 2
+        upscale_to_stage2: float = 2.0,
+        s2_steps: int = 20,
+        s2_cfg: float = 4.0,
+        s2_denoise: float = 1.0,
+        # Stage 3
+        upscale_to_stage3: float = 2.0,
+        s3_steps: int = 15,
+        s3_cfg: float = 2.0,
+        s3_denoise: float = 1.0,
     ) -> Tuple[torch.Tensor]:
         pipe = pipeline["pipeline"]
         offload_vae = pipeline.get("offload_vae", False)
 
         # ── Resolve aspect ratio ────────────────────────────────────────
         w_ratio, h_ratio = ASPECT_RATIOS.get(aspect_ratio, (1, 1))
-        target_mp = max(target_mp, 2.0)  # enforce 2 MP minimum
 
-        # ── Plan stages ─────────────────────────────────────────────────
-        #  Stage 1: 0.5 MP, 15 steps, 2× CFG
-        #  Stage 2: 2 MP,   N steps,  1× CFG
-        #  Stage 3: target, N steps,  0.5× CFG  (only if target > 2 MP)
-        three_stages = target_mp > 2.0
+        # ── Determine which stages are active ───────────────────────────
+        do_stage2 = upscale_to_stage2 > 0
+        do_stage3 = do_stage2 and upscale_to_stage3 > 0
 
-        s1_steps = 15
-        remaining = max(steps - s1_steps, 5)  # at least 5 for refine
-        if three_stages:
-            s2_steps = remaining // 2
-            s3_steps = remaining - s2_steps
+        # ── Compute per-stage dimensions ────────────────────────────────
+        s1_w, s1_h = compute_dimensions_from_ratio(w_ratio, h_ratio, s1_mp)
+        s1_mp_actual = s1_w * s1_h / 1e6
+
+        if do_stage2:
+            s2_mp = s1_mp_actual * upscale_to_stage2
+            s2_w, s2_h = compute_dimensions_from_ratio(w_ratio, h_ratio, s2_mp)
+            s2_mp_actual = s2_w * s2_h / 1e6
         else:
-            s2_steps = remaining
-            s3_steps = 0
+            s2_w = s2_h = s2_mp_actual = 0
 
-        s1_w, s1_h = compute_dimensions_from_ratio(w_ratio, h_ratio, 0.5)
-        s2_w, s2_h = compute_dimensions_from_ratio(w_ratio, h_ratio, 2.0)
-        s3_w, s3_h = compute_dimensions_from_ratio(w_ratio, h_ratio, target_mp)
+        if do_stage3:
+            s3_mp = s2_mp_actual * upscale_to_stage3
+            s3_w, s3_h = compute_dimensions_from_ratio(w_ratio, h_ratio, s3_mp)
+            s3_mp_actual = s3_w * s3_h / 1e6
+        else:
+            s3_w = s3_h = s3_mp_actual = 0
 
-        s1_cfg = min(true_cfg_scale * 2.0, 20.0)
-        s2_cfg = true_cfg_scale
-        s3_cfg = max(true_cfg_scale * 0.5, 1.0)
+        stage_count = 3 if do_stage3 else (2 if do_stage2 else 1)
+        total_steps = s1_steps + (s2_steps if do_stage2 else 0) + (s3_steps if do_stage3 else 0)
 
-        total_steps = s1_steps + s2_steps + s3_steps
-        stage_count = 3 if three_stages else 2
-
-        print(f"[EricQwenImage-MS] Multi-stage generation: {stage_count} stages, "
+        # ── Print plan ──────────────────────────────────────────────────
+        print(f"[EricQwenImage-MS] Multi-stage generation: {stage_count} stage(s), "
               f"{total_steps} total steps")
-        print(f"  Stage 1: {s1_w}×{s1_h} ({s1_w*s1_h/1e6:.2f} MP), "
+        print(f"  Stage 1: {s1_w}x{s1_h} ({s1_mp_actual:.2f} MP), "
               f"{s1_steps} steps, CFG={s1_cfg:.1f}")
-        print(f"  Stage 2: {s2_w}×{s2_h} ({s2_w*s2_h/1e6:.2f} MP), "
-              f"{s2_steps} steps, CFG={s2_cfg:.1f}, denoise={stage2_denoise:.2f}")
-        if three_stages:
-            print(f"  Stage 3: {s3_w}×{s3_h} ({s3_w*s3_h/1e6:.2f} MP), "
-                  f"{s3_steps} steps, CFG={s3_cfg:.1f}, denoise={stage3_denoise:.2f}")
+        if do_stage2:
+            print(f"  Stage 2: {s2_w}x{s2_h} ({s2_mp_actual:.2f} MP), "
+                  f"{s2_steps} steps, CFG={s2_cfg:.1f}, "
+                  f"upscale={upscale_to_stage2:.1f}x area, denoise={s2_denoise:.2f}")
+        if do_stage3:
+            print(f"  Stage 3: {s3_w}x{s3_h} ({s3_mp_actual:.2f} MP), "
+                  f"{s3_steps} steps, CFG={s3_cfg:.1f}, "
+                  f"upscale={upscale_to_stage3:.1f}x area, denoise={s3_denoise:.2f}")
 
         # ── Common setup ────────────────────────────────────────────────
         device = pipe._execution_device if hasattr(pipe, "_execution_device") else "cuda"
@@ -250,6 +304,7 @@ class EricQwenImageMultiStage:
         def make_cb():
             def on_step_end(_pipe, step_idx, _timestep, cb_kwargs):
                 pbar.update(1)
+                _check_cancelled()  # allow mid-step cancellation
                 return cb_kwargs
             return on_step_end
 
@@ -262,9 +317,12 @@ class EricQwenImageMultiStage:
 
         try:
             # ════════════════════════════════════════════════════════════
-            #  STAGE 1 — Draft at 0.5 MP (full txt2img from noise)
+            #  STAGE 1 — Draft (txt2img from noise)
             # ════════════════════════════════════════════════════════════
-            print(f"[EricQwenImage-MS] ── Stage 1/{ stage_count} ──")
+            _check_cancelled()
+            print(f"[EricQwenImage-MS] -- Stage 1/{stage_count} --")
+
+            s1_output_type = "latent" if do_stage2 else "pil"
             s1_result = pipe(
                 prompt=prompt,
                 negative_prompt=neg,
@@ -274,33 +332,37 @@ class EricQwenImageMultiStage:
                 true_cfg_scale=s1_cfg,
                 generator=generator,
                 callback_on_step_end=make_cb(),
-                output_type="latent",
+                output_type=s1_output_type,
             )
-            s1_latents = s1_result.images  # packed latents when output_type="latent"
+
+            if not do_stage2:
+                pil_image = s1_result.images[0]
+                tensor = pil_to_tensor(pil_image).unsqueeze(0)
+                return (tensor,)
+
+            s1_latents = s1_result.images  # packed latents
 
             # ════════════════════════════════════════════════════════════
-            #  STAGE 2 — Refine at 2 MP
+            #  STAGE 2 — Refine
             # ════════════════════════════════════════════════════════════
-            print(f"[EricQwenImage-MS] ── Stage 2/{stage_count} ──")
+            _check_cancelled()
+            print(f"[EricQwenImage-MS] -- Stage 2/{stage_count} --")
+
             s2_latents = _upscale_latents(
                 s1_latents, s1_h, s1_w, s2_h, s2_w, vae_scale_factor
             )
             s2_latents = self._apply_denoise_noise(
-                s2_latents, stage2_denoise, generator, device
+                s2_latents, s2_denoise, generator, device
             )
 
-            if three_stages:
-                s2_output_type = "latent"
-            else:
-                s2_output_type = "pil"
-
+            s2_output_type = "latent" if do_stage3 else "pil"
             s2_result = pipe(
                 prompt=prompt,
                 negative_prompt=neg,
                 height=s2_h,
                 width=s2_w,
                 num_inference_steps=s2_steps,
-                sigmas=self._build_sigmas(s2_steps, stage2_denoise),
+                sigmas=self._build_sigmas(s2_steps, s2_denoise),
                 true_cfg_scale=s2_cfg,
                 generator=generator,
                 latents=s2_latents,
@@ -308,23 +370,24 @@ class EricQwenImageMultiStage:
                 output_type=s2_output_type,
             )
 
-            if not three_stages:
-                # Done — decode to image
+            if not do_stage3:
                 pil_image = s2_result.images[0]
                 tensor = pil_to_tensor(pil_image).unsqueeze(0)
                 return (tensor,)
 
-            s2_final_latents = s2_result.images  # still packed latents
+            s2_final_latents = s2_result.images
 
             # ════════════════════════════════════════════════════════════
-            #  STAGE 3 — Final at target MP
+            #  STAGE 3 — Final
             # ════════════════════════════════════════════════════════════
-            print(f"[EricQwenImage-MS] ── Stage 3/{stage_count} ──")
+            _check_cancelled()
+            print(f"[EricQwenImage-MS] -- Stage 3/{stage_count} --")
+
             s3_latents = _upscale_latents(
                 s2_final_latents, s2_h, s2_w, s3_h, s3_w, vae_scale_factor
             )
             s3_latents = self._apply_denoise_noise(
-                s3_latents, stage3_denoise, generator, device
+                s3_latents, s3_denoise, generator, device
             )
 
             s3_result = pipe(
@@ -333,7 +396,7 @@ class EricQwenImageMultiStage:
                 height=s3_h,
                 width=s3_w,
                 num_inference_steps=s3_steps,
-                sigmas=self._build_sigmas(s3_steps, stage3_denoise),
+                sigmas=self._build_sigmas(s3_steps, s3_denoise),
                 true_cfg_scale=s3_cfg,
                 generator=generator,
                 latents=s3_latents,
@@ -359,13 +422,13 @@ class EricQwenImageMultiStage:
     def _build_sigmas(num_steps: int, denoise: float) -> list:
         """Build a sigma schedule for flow-matching partial denoise.
 
-        Full schedule goes from 1.0 → ~0.  When denoise < 1.0 we start
+        Full schedule goes from 1.0 -> ~0.  When denoise < 1.0 we start
         from a lower sigma, effectively skipping the noisiest portion.
         """
         full_sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
         if denoise >= 1.0:
             return full_sigmas.tolist()
-        # Trim from the front — keep the last (denoise * N) steps
+        # Trim from the front -- keep the last (denoise * N) steps
         keep = max(1, int(round(num_steps * denoise)))
         return full_sigmas[-keep:].tolist()
 
@@ -379,11 +442,9 @@ class EricQwenImageMultiStage:
         starting sigma level.
         """
         if denoise >= 1.0:
-            # Full re-noise — replace with random
             noise = torch.randn_like(latents)
             return noise
 
-        # Partial: blend latents with noise at sigma = denoise
         sigma = denoise
         noise = torch.randn(latents.shape, generator=generator,
                             device=latents.device, dtype=latents.dtype)

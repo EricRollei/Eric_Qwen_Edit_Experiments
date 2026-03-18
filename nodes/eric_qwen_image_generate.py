@@ -167,13 +167,18 @@ class EricQwenImageGenerate:
         if neg == "":
             neg = None
 
-        # ── ComfyUI progress bar ────────────────────────────────────────
+        # ── ComfyUI progress bar + cancel support ───────────────────────
         import comfy.utils
+        import comfy.model_management
         pbar = comfy.utils.ProgressBar(steps)
 
         def on_step_end(_pipe, step_idx, _timestep, cb_kwargs):
             pbar.update(1)
+            comfy.model_management.throw_exception_if_processing_interrupted()
             return cb_kwargs
+
+        # Check for cancel before starting
+        comfy.model_management.throw_exception_if_processing_interrupted()
 
         # ── Spectrum acceleration (if configured) ───────────────────────
         _spectrum_unpatch = None
