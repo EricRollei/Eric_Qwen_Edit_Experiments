@@ -428,6 +428,13 @@ class EricQwenImageUltraGen:
         # ── Common setup ────────────────────────────────────────────────
         device = pipe._execution_device if hasattr(pipe, "_execution_device") else "cuda"
 
+        # ── Ensure transformer is on GPU (may have been offloaded on previous run) ──
+        transformer_device = next(pipe.transformer.parameters()).device
+        if str(transformer_device) != str(device):
+            print(f"[UltraGen] Moving transformer back to {device} (was on {transformer_device})")
+            pipe.transformer = pipe.transformer.to(device)
+            torch.cuda.empty_cache()
+
         # ── Per-stage seed logic ────────────────────────────────────────
         def _make_generator(s: int):
             return torch.Generator(device=device).manual_seed(s) if s > 0 else None
@@ -500,8 +507,7 @@ class EricQwenImageUltraGen:
         extra_kwargs = {}
 
         # max_sequence_length for the text encoder
-        if max_sequence_length != 512:
-            extra_kwargs["max_sequence_length"] = max_sequence_length
+        extra_kwargs["max_sequence_length"] = max_sequence_length
 
         # ── Compute mu for each active refine stage ──────────────────────
         if do_stage2:
