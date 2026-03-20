@@ -12,7 +12,7 @@ Key improvements over the original multi-stage node:
   - max_sequence_length exposed (512-1024) for detailed prompt capture
   - Official Chinese negative prompt as default
   - Spectrum acceleration support on stage 1
-  - Defaults tuned from user testing (0.6 MP s1, high CFG, 6x upscale)
+  - Defaults tuned from user testing (0.5 MP s1, 4x upscale, offset seeds, karras S3)
   - Full per-stage control retained for experimentation
 
 Architecture:
@@ -98,7 +98,7 @@ class EricQwenImageUltraGen:
     • Official Chinese negative prompt as default
     • max_sequence_length up to 1024 for detailed prompts
     • Spectrum acceleration on Stage 1
-    • Tuned defaults: 0.6 MP s1 → 6× upscale → high-step s2 refinement
+    • Tuned defaults: 0.5 MP s1 → 4× upscale → 26-step s2 refinement
 
     Full per-stage control retained:
     - Set upscale_to_stage2 = 0 → output Stage 1 only
@@ -150,7 +150,7 @@ class EricQwenImageUltraGen:
                     "tooltip": "Random seed (0 = random)"
                 }),
                 "seed_mode": (["same_all_stages", "offset_per_stage", "random_per_stage"], {
-                    "default": "same_all_stages",
+                    "default": "offset_per_stage",
                     "tooltip": (
                         "How seeds are chosen for each stage:\n"
                         "• same_all_stages — one generator for all stages\n"
@@ -163,14 +163,14 @@ class EricQwenImageUltraGen:
 
                 # ── Pipeline parameters (NEW in v2) ─────────────────────
                 "max_sequence_length": ("INT", {
-                    "default": 512,
+                    "default": 1024,
                     "min": 128,
                     "max": 1024,
                     "step": 64,
                     "tooltip": (
                         "Maximum prompt token length for the text encoder.\n"
-                        "Default 512. Increase to 1024 for very detailed\n"
-                        "prompts that exceed the default token budget."
+                        "Default 1024 for full prompt capacity.\n"
+                        "Reduce to 512 if not using detailed prompts."
                     )
                 }),
 
@@ -207,18 +207,18 @@ class EricQwenImageUltraGen:
 
                 # ── Stage 2 ─────────────────────────────────────────────
                 "upscale_to_stage2": ("FLOAT", {
-                    "default": 7.0,
+                    "default": 4.0,
                     "min": 0.0,
                     "max": 10.0,
                     "step": 0.5,
                     "tooltip": (
                         "Upscale factor (area) from Stage 1 to Stage 2.\n"
-                        "Default 6.0 — from 0.6 MP to ~3.6 MP.\n"
+                        "Default 4.0 — from 0.5 MP to ~2.0 MP.\n"
                         "Set to 0 to skip Stage 2 & 3 (output Stage 1 only)."
                     )
                 }),
                 "s2_steps": ("INT", {
-                    "default": 30,
+                    "default": 26,
                     "min": 1,
                     "max": 200,
                     "step": 1,
@@ -239,7 +239,7 @@ class EricQwenImageUltraGen:
                     )
                 }),
                 "s2_denoise": ("FLOAT", {
-                    "default": 0.80,
+                    "default": 0.85,
                     "min": 0.1,
                     "max": 1.0,
                     "step": 0.05,
@@ -290,7 +290,7 @@ class EricQwenImageUltraGen:
                     "tooltip": "Stage 3 true CFG scale (lower to avoid over-sharpening)"
                 }),
                 "s3_denoise": ("FLOAT", {
-                    "default": 0.40,
+                    "default": 0.45,
                     "min": 0.1,
                     "max": 1.0,
                     "step": 0.05,
@@ -301,7 +301,7 @@ class EricQwenImageUltraGen:
                     )
                 }),
                 "s3_sigma_schedule": (["linear", "balanced", "karras"], {
-                    "default": "linear",
+                    "default": "karras",
                     "tooltip": (
                         "Sigma schedule curve for Stage 3 final polish.\n"
                         "• linear — uniform spacing (default)\n"
@@ -323,7 +323,7 @@ class EricQwenImageUltraGen:
                 }),
                 "upscale_vae_mode": (
                     ["disabled", "inter_stage", "final_decode", "both"], {
-                    "default": "disabled",
+                    "default": "both",
                     "tooltip": (
                         "How the upscale VAE is used (requires upscale_vae).\n"
                         "• disabled — upscale VAE ignored even if connected\n"

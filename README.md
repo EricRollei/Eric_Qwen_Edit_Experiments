@@ -625,7 +625,7 @@ Progressive multi-stage text-to-image generation with full per-stage control. Up
 
 ### Eric Qwen-Image UltraGen
 
-Quality-focused multi-stage text-to-image generation (v2). Incorporates all Qwen-Image-2512 best practices: official Chinese negative prompt as default, `max_sequence_length` up to 1024 for detailed prompts, Spectrum acceleration on Stage 1, tuned defaults (0.5 MP s1 → 7× upscale → high-step s2 refinement), per-stage seed modes, sigma schedule selection, and optional upscale VAE for 2× super-resolution decode.
+Quality-focused multi-stage text-to-image generation (v2). Incorporates all Qwen-Image-2512 best practices: official Chinese negative prompt as default, `max_sequence_length` up to 1024 for detailed prompts, Spectrum acceleration on Stage 1, tuned defaults (0.5 MP s1 → 4× upscale → 26-step s2 refinement), per-stage seed modes, sigma schedule selection, and optional upscale VAE for 2× super-resolution decode.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -634,27 +634,27 @@ Quality-focused multi-stage text-to-image generation (v2). Incorporates all Qwen
 | `negative_prompt` | STRING | *(official Chinese default)* | Official Qwen-Image-2512 negative prompt |
 | `aspect_ratio` | COMBO | `1:1 Square` | Aspect ratio applied at every stage |
 | `seed` | INT | `0` | Random seed (0 = random) |
-| `seed_mode` | COMBO | `same_all_stages` | `same_all_stages`, `offset_per_stage` (S2=seed+1, S3=seed+2), or `random_per_stage` |
-| `max_sequence_length` | INT | `512` | Max prompt token length (128–1024, step 64). Increase for very detailed prompts. |
+| `seed_mode` | COMBO | `offset_per_stage` | `same_all_stages`, `offset_per_stage` (S2=seed+1, S3=seed+2), or `random_per_stage` |
+| `max_sequence_length` | INT | `1024` | Max prompt token length (128–1024, step 64). Full capacity by default. |
 | **Stage 1** | | | |
 | `s1_mp` | FLOAT | `0.5` | Stage 1 resolution in megapixels |
 | `s1_steps` | INT | `15` | Stage 1 inference steps |
 | `s1_cfg` | FLOAT | `10.0` | Stage 1 true CFG. High CFG at low res locks in composition. |
 | **Stage 2** | | | |
-| `upscale_to_stage2` | FLOAT | `7.0` | Upscale factor (area) S1→S2. 0 = skip S2 & S3. |
-| `s2_steps` | INT | `30` | Stage 2 inference steps (main refinement) |
+| `upscale_to_stage2` | FLOAT | `4.0` | Upscale factor (area) S1→S2. 0 = skip S2 & S3. |
+| `s2_steps` | INT | `26` | Stage 2 inference steps (main refinement) |
 | `s2_cfg` | FLOAT | `4.0` | Stage 2 true CFG (matches official recommendation) |
-| `s2_denoise` | FLOAT | `0.80` | Stage 2 denoise |
+| `s2_denoise` | FLOAT | `0.85` | Stage 2 denoise |
 | `s2_sigma_schedule` | COMBO | `linear` | `linear`, `balanced` (Karras ρ=3), or `karras` (Karras ρ=7) |
 | **Stage 3** | | | |
 | `upscale_to_stage3` | FLOAT | `2.0` | Upscale factor (area) S2→S3. 0 = disabled. |
 | `s3_steps` | INT | `18` | Stage 3 inference steps |
 | `s3_cfg` | FLOAT | `2.0` | Stage 3 true CFG |
-| `s3_denoise` | FLOAT | `0.40` | Stage 3 denoise (0.3–0.5 recommended for final polish) |
-| `s3_sigma_schedule` | COMBO | `linear` | Sigma schedule for S3 |
+| `s3_denoise` | FLOAT | `0.45` | Stage 3 denoise (0.3–0.5 recommended for final polish) |
+| `s3_sigma_schedule` | COMBO | `karras` | Sigma schedule for S3 (karras recommended for fine micro-texture) |
 | **Upscale VAE** | | | |
 | `upscale_vae` | UPSCALE_VAE | *(optional)* | From Eric Qwen Upscale VAE Loader |
-| `upscale_vae_mode` | COMBO | `disabled` | `disabled`, `inter_stage`, `final_decode`, or `both` (see Upscale VAE section below) |
+| `upscale_vae_mode` | COMBO | `both` | `disabled`, `inter_stage`, `final_decode`, or `both` (see Upscale VAE section below) |
 
 **Output:** `IMAGE`
 
