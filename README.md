@@ -27,42 +27,74 @@ ComfyUI custom nodes for **Qwen-Image-Edit-2511** (image editing) and **Qwen-Ima
 - **Extended prompt token length** — Configurable `max_sequence_length` (up to 1024 tokens) in UltraGen for highly detailed prompts — not exposed by other Qwen-Image nodes or workflows
 - **Progress bars** — Native ComfyUI progress display during denoising on every generation/edit node
 
-## Why Use This?
+## What Makes This Different
 
-The default Qwen-Image-Edit pipeline in diffusers forces all outputs to ~1 MP (1024×1024), regardless of input size. This means:
+Most ComfyUI Qwen nodes decompose the model into ComfyUI's generic UNET → Scheduler → Sampler graph. These nodes take a fundamentally different approach — running the **real Hugging Face diffusers pipeline** end-to-end, with targeted patches that unlock capabilities no other Qwen node set provides.
 
-- A 12 MP photo gets reduced to 1 MP
-- Fine details are lost
-- You can't edit high-resolution images directly
+### 1. Native-resolution editing up to 17 MP
 
-These nodes use a custom pipeline that:
+The stock diffusers `QwenImageEditPlusPipeline` forces all outputs to ~1 MP regardless of input size — a 12 MP photo gets crushed to 1 MP and fine details are lost. This node set patches the pipeline to **preserve your input resolution** (aligned to 32 px) up to a configurable cap (default 16 MP, supports 17 MP). No other ComfyUI Qwen-Edit implementation does this.
 
-1. **Preserves input resolution** when smaller than max_mp
-2. **Scales down proportionally** when input exceeds max_mp
-3. **Aligns to 32 pixels** as required by the model
+| Input | Stock Pipeline | Eric Qwen-Edit (max_mp=16) |
+|-------|----------------|----------------------------|
+| 2 MP  | 1 MP output    | 2 MP output                |
+| 6 MP  | 1 MP output    | 6 MP output                |
+| 20 MP | 1 MP output    | 16 MP output (capped)      |
 
-### Example
+### 2. Real FlowMatch diffusers pipeline — not the UNET/KSampler abstraction
 
-| Input | Default Pipeline | Eric Qwen-Edit (max_mp=16) |
-|-------|------------------|----------------------------|
-| 2 MP  | 1 MP output      | 2 MP output                |
-| 6 MP  | 1 MP output      | 6 MP output                |
-| 20 MP | 1 MP output      | 16 MP output (capped)      |
+ComfyUI's native approach treats every diffusion model as a generic UNET with a separate sampler and scheduler. Users must manually add an **"Aura Flow Shift"** node and guess shift values. This loses model-specific details and produces inferior results.
 
-### Automatic Sigma Scheduling (No "Aura Flow Shift" Needed)
-
-Many Qwen-Image workflows in ComfyUI use a **ModelSamplingAuraFlow** (or "Aura Flow Shift") node in the model path. That node exists because ComfyUI's native UNET → KSampler approach treats the model, scheduler, and sampler as separate graph nodes — users have to manually configure the **sigma time-shift** that flow-matching models need to produce good results. Without it the sigma schedule is unshifted and the model produces washed-out or burned images.
-
-These nodes use the **Hugging Face diffusers pipeline** directly, which handles sigma scheduling automatically:
+These nodes call the **`FlowMatchEulerDiscreteScheduler`** pipeline directly, so every sigma shift, timestep, and conditioning step matches exactly what the model was trained with:
 
 | Aspect | ComfyUI native (UNET + KSampler) | Eric Qwen-Edit / Qwen-Image (diffusers) |
 |--------|-----------------------------------|------------------------------------------|
-| Sigma shifting | Manual — requires an extra "Aura Flow Shift" node with a user-chosen shift value | Automatic — `FlowMatchEulerDiscreteScheduler` with `use_dynamic_shifting` reads the correct parameters from the model config |
-| Resolution-aware | No — fixed shift regardless of output size | Yes — time-shift mu is interpolated from the output resolution's latent sequence length |
+| Sigma shifting | Manual — requires an extra "Aura Flow Shift" node with a user-chosen shift value | Automatic — `FlowMatchEulerDiscreteScheduler` with `use_dynamic_shifting` reads parameters from the model config |
+| Resolution-aware | No — fixed shift regardless of output size | Yes — time-shift μ is interpolated from the output resolution's latent sequence length |
 | Shift formula | `α·t / (1 + (α-1)·t)` with a single hand-tuned α | Exponential: `exp(μ) / (exp(μ) + (1/t - 1))` + terminal stretch, where μ adapts per resolution |
-| Configuration | User must wire the node and pick values | Zero-config — parameters come from `scheduler_config.json` shipped with the model |
+| Dual conditioning | Lost — UNET abstraction has no concept of separate VL + VAE/ref paths | Preserved — VL path (~384 px semantic tokens via Qwen2.5-VL) + VAE/ref path (output-resolution pixel latents), individually controllable per image |
+| Configuration | User must wire shift nodes and pick values | Zero-config — parameters come from `scheduler_config.json` shipped with the model |
 
-In short, the diffusers scheduler already performs a more sophisticated, resolution-adaptive version of what the Aura Flow Shift node does manually. **You do not need any extra shift nodes with these nodes.**
+**You do not need any extra shift nodes with these nodes.**
+
+### 3. Spectrum acceleration — training-free 3–5× speedup (CVPR 2026)
+
+Implements adaptive spectral feature forecasting from a CVPR 2026 paper. Instead of running all transformer blocks on every denoising step, Spectrum predicts outputs on skipped steps using Chebyshev polynomial regression with Newton forward-difference blending. The flexible-window schedule caches more aggressively in later steps where changes are smaller. Applies to both edit and generation nodes. No other ComfyUI node set ships this.
+
+### 4. Cross-architecture 2× upscale VAE — 50 MP+ generation
+
+Exploits a discovery that the **Wan2.1** and **Qwen-Image** VAEs are architecturally identical (`AutoencoderKLWan` / `AutoencoderKLQwenImage`) and share the same latent space. This lets us use [spacepxl's Wan2.1-VAE-upscale2x](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x) decoder on Qwen-Image latents for free 2× super-resolution during VAE decode. Four modes:
+
+| Mode | Effect |
+|------|--------|
+| `disabled` | Standard Qwen VAE decode |
+| `inter_stage` | Decode S2 at 2× via upscale VAE, re-encode for S3 input |
+| `final_decode` | Replace final VAE decode with 2× upscale VAE |
+| `both` | Inter-stage + final decode — stacks for **4× total** (50+ MP output) |
+
+### 5. Extended prompt token length (`max_sequence_length` up to 1024)
+
+The `max_sequence_length` parameter is buried inside the diffusers pipeline and hardcoded to 512 everywhere else. UltraGen exposes it with range 128–1024. Padding positions are masked out via attention masks, so there's **zero quality penalty** for setting it higher — only a negligible compute increase (~8 MB VRAM). Long, detailed prompts (~200 words) that would be silently truncated at 512 tokens now reach the model in full.
+
+### 6. Built-in LLM prompt rewriting
+
+A dedicated node that calls any **OpenAI-compatible API** (Ollama, LM Studio, DeepSeek, OpenAI) to auto-expand terse prompts into rich ~200-word descriptions following Qwen's own recommended prompt methodology. API keys are loaded securely from environment variables or `api_keys.ini` — never stored in the workflow JSON. Includes language selection (English/Chinese), temperature control, custom instructions, and a passthrough toggle for A/B testing.
+
+### 7. Multi-stage progressive generation with per-stage control
+
+Up to 3 stages of progressive upscale → re-denoise, each with independent control over steps, CFG scale, denoise strength, sigma schedule (`linear` / `balanced` / `karras`), and seed mode (`same_all_stages` / `offset_per_stage` / `random_per_stage`). The UltraGen node combines all of this with tuned defaults that incorporate Qwen's official best practices — including the Chinese negative prompt that materially improves results.
+
+### 8. True CFG with norm-preserving guidance
+
+Two full transformer forward passes per step (conditional + unconditional) for genuine classifier-free guidance — not the approximations that single-pass "CFG-like" implementations use. UltraGen uses norm-preserving CFG rescaling that makes high CFG values (8–10) safe at low resolution for locking in composition, with lower CFG (2–4) at higher resolution stages for refinement.
+
+### 9. Automatic VRAM management
+
+Transformer is automatically offloaded to CPU before upscale VAE decode at every exit point. Tiled decode is used for large images. The pipeline manages device placement so you don't have to wire manual offload nodes.
+
+### 10. Chainable LoRA with weight control
+
+Apply multiple LoRAs in sequence with independent weight control (−2.0 to 2.0), and cleanly unload all LoRAs to restore the base model. Works on both edit and generation pipelines.
 
 ## Installation
 
