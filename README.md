@@ -1,7 +1,7 @@
 # Eric Qwen-Edit & Qwen-Image Nodes
 
 ComfyUI custom nodes for **Qwen-Image-Edit-2511** (image editing) and **Qwen-Image-2512** (text-to-image generation) — 20-billion-parameter MMDiT models by Qwen (Alibaba).  
-17 nodes covering loading, single-image editing, multi-image fusion, style transfer, inpainting, inpaint-with-transfer, LoRA, Spectrum acceleration, delta overlay, mask utilities, and **text-to-image generation**.
+24 nodes covering loading, single-image editing, multi-image fusion, style transfer, inpainting, inpaint-with-transfer, LoRA, Spectrum acceleration, delta overlay, mask utilities, **text-to-image generation**, multi-stage generation, prompt rewriting, and **2× VAE super-resolution upscaling**.
 
 ![8 MP image editing in just a few nodes](examples/FireRed11-8mp.png)
 *Edit images at full 8 MP resolution — just a loader, LoRA, and edit node.*
@@ -16,7 +16,13 @@ ComfyUI custom nodes for **Qwen-Image-Edit-2511** (image editing) and **Qwen-Ima
 - **Supports up to 16 MP** — Edit or generate large images directly
 - **True CFG** — Two full transformer forward passes per step (conditional + unconditional)
 - **Dual conditioning paths** — VL path (~384 px semantic tokens via Qwen2.5-VL) + VAE/ref path (output-resolution pixel latents), individually controllable per image (edit nodes)
+- **Multi-stage generation** — Progressive upscale + re-denoise across up to 3 stages with per-stage control over steps, CFG, denoise, and sigma schedule
+- **UltraGen** — Quality-focused v2 multi-stage node with Qwen-Image-2512 best practices, per-stage seeds, sigma schedules, and upscale VAE integration
 - **Spectrum acceleration** — Training-free CVPR 2026 Chebyshev feature forecaster for ~3–5× speedup (both edit and generation)
+- **Prompt rewriting** — Local or remote LLM-powered prompt enhancement via any OpenAI-compatible API (Ollama, LM Studio, DeepSeek, etc.)
+- **LoRA support** — Apply and unload LoRAs on both edit and generation pipelines with chainable weight control
+- **2× VAE super-resolution** — Optional [Wan2.1-VAE-upscale2x](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x) integration for free 2× upscale during VAE decode, with inter-stage and final-decode modes
+- **Extended prompt token length** — Configurable `max_sequence_length` (up to 1024 tokens) in UltraGen for highly detailed prompts — not exposed by other Qwen-Image nodes or workflows
 - **Progress bars** — Native ComfyUI progress display during denoising on every generation/edit node
 
 ## Why Use This?
@@ -76,6 +82,9 @@ git clone https://github.com/EricRollei/Eric_Qwen_Edit_Experiments.git
 - **Generation Model**: Download Qwen-Image-2512 (recommended) or Qwen-Image
   - https://huggingface.co/Qwen/Qwen-Image-2512
   - https://huggingface.co/Qwen/Qwen-Image
+- **Upscale VAE** *(optional)*: spacepxl/Wan2.1-VAE-upscale2x (~0.5 GB)
+  - https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x
+  - Only needed for the 2× VAE super-resolution feature in UltraGen
 - **VRAM**:
   - 24 GB for up to 2 MP
   - 48 GB for up to 6 MP
@@ -520,6 +529,196 @@ Free VRAM by unloading the generation pipeline.
 
 ---
 
+### Eric Qwen-Image Apply LoRA
+
+Apply a LoRA to the Qwen-Image generation pipeline. Loads LoRA weights onto the transformer. Multiple Apply LoRA nodes can be chained to stack several LoRAs with different weights. LoRAs are loaded from `ComfyUI/models/loras/`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pipeline` | QWEN_IMAGE_PIPELINE | — | From any generation loader node |
+| `lora_name` | COMBO | — | Select LoRA from `ComfyUI/models/loras/` |
+| `weight` | FLOAT | `1.0` | LoRA weight strength (−2.0 to 2.0, step 0.05). 1.0 = full, 0.5 = half |
+| `lora_path_override` | STRING | *(empty)* | Optional: custom path override (leave empty to use dropdown) |
+
+**Output:** `QWEN_IMAGE_PIPELINE`
+
+---
+
+### Eric Qwen-Image Unload LoRA
+
+Unload all LoRAs from the Qwen-Image generation pipeline. Use to reset the model to its base state before applying different LoRAs, or to free memory.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pipeline` | QWEN_IMAGE_PIPELINE | — | Pipeline with LoRAs to unload |
+
+**Output:** `QWEN_IMAGE_PIPELINE`
+
+---
+
+### Eric Qwen-Image Multi-Stage Generate
+
+Progressive multi-stage text-to-image generation with full per-stage control. Up to 3 stages with independent steps, CFG, resolution, and denoise settings. Latents are upscaled between stages via bislerp and re-noised according to the per-stage denoise strength before re-sampling.
+
+- Set `upscale_to_stage2 = 0` → output Stage 1 only (single-stage).
+- Set `upscale_to_stage3 = 0` → stop after Stage 2 (two-stage).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pipeline` | QWEN_IMAGE_PIPELINE | — | From any generation loader node |
+| `prompt` | STRING | — | Describe the image you want to generate |
+| `negative_prompt` | STRING | *(empty)* | What to avoid in the output |
+| `aspect_ratio` | COMBO | `1:1 Square` | Aspect ratio applied at every stage |
+| `seed` | INT | `0` | Random seed (0 = random) |
+| **Stage 1** | | | |
+| `s1_mp` | FLOAT | `0.5` | Stage 1 resolution in megapixels (0.3–2.0) |
+| `s1_steps` | INT | `15` | Stage 1 inference steps (txt2img from noise) |
+| `s1_cfg` | FLOAT | `8.0` | Stage 1 true CFG scale |
+| **Stage 2** | | | |
+| `upscale_to_stage2` | FLOAT | `2.0` | Upscale factor (area) S1→S2. 0 = skip S2 & S3, output S1 |
+| `s2_steps` | INT | `20` | Stage 2 inference steps |
+| `s2_cfg` | FLOAT | `4.0` | Stage 2 true CFG scale |
+| `s2_denoise` | FLOAT | `1.0` | Stage 2 denoise (1.0 = full, lower preserves prior detail) |
+| **Stage 3** | | | |
+| `upscale_to_stage3` | FLOAT | `2.0` | Upscale factor (area) S2→S3. 0 = skip S3, output S2 |
+| `s3_steps` | INT | `15` | Stage 3 inference steps |
+| `s3_cfg` | FLOAT | `2.0` | Stage 3 true CFG scale |
+| `s3_denoise` | FLOAT | `1.0` | Stage 3 denoise |
+
+**Output:** `IMAGE`
+
+---
+
+### Eric Qwen-Image UltraGen
+
+Quality-focused multi-stage text-to-image generation (v2). Incorporates all Qwen-Image-2512 best practices: official Chinese negative prompt as default, `max_sequence_length` up to 1024 for detailed prompts, Spectrum acceleration on Stage 1, tuned defaults (0.5 MP s1 → 7× upscale → high-step s2 refinement), per-stage seed modes, sigma schedule selection, and optional upscale VAE for 2× super-resolution decode.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pipeline` | QWEN_IMAGE_PIPELINE | — | From any generation loader node |
+| `prompt` | STRING | — | Describe the image. For best results ~200 words. Connect Prompt Rewriter to auto-enhance. |
+| `negative_prompt` | STRING | *(official Chinese default)* | Official Qwen-Image-2512 negative prompt |
+| `aspect_ratio` | COMBO | `1:1 Square` | Aspect ratio applied at every stage |
+| `seed` | INT | `0` | Random seed (0 = random) |
+| `seed_mode` | COMBO | `same_all_stages` | `same_all_stages`, `offset_per_stage` (S2=seed+1, S3=seed+2), or `random_per_stage` |
+| `max_sequence_length` | INT | `512` | Max prompt token length (128–1024, step 64). Increase for very detailed prompts. |
+| **Stage 1** | | | |
+| `s1_mp` | FLOAT | `0.5` | Stage 1 resolution in megapixels |
+| `s1_steps` | INT | `15` | Stage 1 inference steps |
+| `s1_cfg` | FLOAT | `10.0` | Stage 1 true CFG. High CFG at low res locks in composition. |
+| **Stage 2** | | | |
+| `upscale_to_stage2` | FLOAT | `7.0` | Upscale factor (area) S1→S2. 0 = skip S2 & S3. |
+| `s2_steps` | INT | `30` | Stage 2 inference steps (main refinement) |
+| `s2_cfg` | FLOAT | `4.0` | Stage 2 true CFG (matches official recommendation) |
+| `s2_denoise` | FLOAT | `0.80` | Stage 2 denoise |
+| `s2_sigma_schedule` | COMBO | `linear` | `linear`, `balanced` (Karras ρ=3), or `karras` (Karras ρ=7) |
+| **Stage 3** | | | |
+| `upscale_to_stage3` | FLOAT | `2.0` | Upscale factor (area) S2→S3. 0 = disabled. |
+| `s3_steps` | INT | `18` | Stage 3 inference steps |
+| `s3_cfg` | FLOAT | `2.0` | Stage 3 true CFG |
+| `s3_denoise` | FLOAT | `0.40` | Stage 3 denoise (0.3–0.5 recommended for final polish) |
+| `s3_sigma_schedule` | COMBO | `linear` | Sigma schedule for S3 |
+| **Upscale VAE** | | | |
+| `upscale_vae` | UPSCALE_VAE | *(optional)* | From Eric Qwen Upscale VAE Loader |
+| `upscale_vae_mode` | COMBO | `disabled` | `disabled`, `inter_stage`, `final_decode`, or `both` (see Upscale VAE section below) |
+
+**Output:** `IMAGE`
+
+---
+
+### Eric Qwen-Image Spectrum Accelerator
+
+Training-free diffusion sampling speedup using adaptive spectral feature forecasting (CVPR 2026). Predicts transformer outputs on skipped steps via Chebyshev polynomial regression instead of running all transformer blocks. Best for ≥20 inference steps and true CFG runs (2× transformer passes per step → double the savings). Wire between the Image Loader and any generation node.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pipeline` | QWEN_IMAGE_PIPELINE | — | Pipeline to accelerate |
+| `enable` | BOOLEAN | `True` | Enable/disable Spectrum acceleration |
+| `warmup_steps` | INT | `3` | Initial denoising steps that always run the full transformer (2–4 recommended) |
+| `window_size` | INT | `2` | Base period between actual transformer evaluations. 2 = every other step cached. |
+| `flex_window` | FLOAT | `0.75` | Window growth rate. Later steps change less, so larger windows are safe. 0 = fixed window. |
+| `w` | FLOAT | `0.5` | Blend between Chebyshev predictor (1.0) and Newton forward-difference predictor (0.0) |
+| `lam` | FLOAT | `0.1` | Ridge regularization for Chebyshev regression. Higher = smoother predictions. |
+| `M` | INT | `4` | Chebyshev polynomial degree (1–8). Higher captures complex trajectories but risks overfitting. |
+| `min_steps` | INT | `15` | Auto-disable when `num_inference_steps` < this (low step counts don't benefit) |
+
+**Output:** `QWEN_IMAGE_PIPELINE`
+
+---
+
+### Eric Qwen Prompt Rewriter
+
+Enhance image prompts using a local or remote LLM. Rewrites terse prompts into rich ~200-word descriptions following Qwen-Image-2512 recommended methodology. Connects to any OpenAI-compatible API (Ollama, LM Studio, DeepSeek, OpenAI, etc.). API keys are loaded securely from environment variables or `api_keys.ini` — never stored in the workflow file. Output connects to the prompt input of any generation node.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | STRING | — | Original image description to enhance |
+| `api_url` | STRING | `http://localhost:11434/v1` | OpenAI-compatible API base URL |
+| `model` | STRING | `qwen3:8b` | Model name on the API server |
+| `language` | COMBO | `English` | Language for the rewritten prompt (`English` or `Chinese`) |
+| `temperature` | FLOAT | `0.7` | LLM temperature — lower = more faithful, higher = more creative |
+| `max_tokens` | INT | `2048` | Max tokens for LLM response |
+| `custom_instructions` | STRING | *(empty)* | Additional instructions appended to the system prompt |
+| `passthrough` | BOOLEAN | `False` | Skip rewriting and pass prompt through unchanged (for A/B testing) |
+
+**Output:** `enhanced_prompt` (STRING)
+
+---
+
+## 2× Upscale VAE (Super-Resolution Decode)
+
+The **Wan2.1-VAE-upscale2x** by [spacepxl](https://huggingface.co/spacepxl) is a decoder-only finetune of the Wan2.1 VAE that outputs 12 channels instead of 3. After decode, `pixel_shuffle(12→3, 2×)` produces a **2× upscaled image** — effectively free super-resolution during VAE decode with no extra diffusion steps.
+
+The Wan2.1 and Qwen-Image VAEs are architecturally identical (`AutoencoderKLWan` / `AutoencoderKLQwenImage`) and share the same latent space, so the upscale VAE works directly with Qwen-Image latents.
+
+### How it works
+
+1. **Load the upscale VAE** with the **Eric Qwen Upscale VAE Loader** node
+2. **Connect it** to the `upscale_vae` input on the **Eric Qwen-Image UltraGen** node
+3. **Choose a mode** via the `upscale_vae_mode` dropdown
+
+### Upscale VAE Modes
+
+| Mode | Description |
+|------|-------------|
+| `disabled` | Upscale VAE ignored even if connected (safe default) |
+| `inter_stage` | Decode S2 latents at 2× via the upscale VAE, re-encode back to latents, and feed the 2× canvas to S3. Replaces the bislerp inter-stage upscale with a higher-quality decode→2×→re-encode round trip. Requires 3 active stages. |
+| `final_decode` | Replace the final stage's normal VAE decode with the 2× upscale decode. The output image is 2× the resolution of the final denoising stage. |
+| `both` | Inter-stage S2→S3 **and** 2× final decode. These stack: S3 runs on a 2× canvas from inter-stage, then the output gets another 2× from final decode = **4× total** vs. S2. |
+
+### VRAM Management
+
+The upscale VAE is kept on CPU until needed. Before decode, the diffusion transformer is automatically offloaded to CPU to free VRAM. For large images, **tiled VAE decoding** is automatically enabled when latent spatial dimensions exceed 128 (roughly ≥1024 px per side before the 2× upscale).
+
+### Typical workflow
+
+```
+[Qwen-Image Loader] → [LoRA] → [Spectrum] → [Upscale VAE Loader] → [UltraGen]
+                                                     ↑                    ↑
+                                              upscale_vae ──────── upscale_vae
+                                                              upscale_vae_mode = final_decode
+```
+
+---
+
+### Eric Qwen Upscale VAE Loader
+
+Load the Wan2.1 2× upscale VAE. The model is kept on CPU until decode is requested.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model_path` | STRING | `spacepxl/Wan2.1-VAE-upscale2x` | HuggingFace model ID or local path |
+| `subfolder` | STRING | `diffusers/Wan2.1_VAE_upscale2x_imageonly_real_v1` | Subfolder within the repo containing config.json + weights. Leave blank if model_path already points to the correct directory. |
+| `dtype` | COMBO | `bfloat16` | Model precision: bfloat16 (recommended), float16, float32 |
+
+**Output:** `UPSCALE_VAE`
+
+The first run downloads the model from HuggingFace (~0.5 GB). Subsequent runs load from the local HuggingFace cache. You can also download the model manually and point `model_path` to the local directory.
+
+> **Model source:** [spacepxl/Wan2.1-VAE-upscale2x](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x) — a decoder-only finetune of the Wan2.1 VAE by spacepxl. The specific subfolder used is `diffusers/Wan2.1_VAE_upscale2x_imageonly_real_v1` (image-only variant, trained on real images).
+
+---
+
 ## Architecture Notes
 
 Qwen-Image-Edit-2511 uses a **dual conditioning path**:
@@ -562,10 +761,27 @@ See the `examples/` folder for workflow files and screenshots.
 8. **Delta Overlay** is great for up-res workflows: edit at low resolution, upscale the original, then apply only the changed pixels at full resolution.
 9. **Generation resolution presets** let you quickly choose common aspect ratios without doing pixel math.
 10. **Edit and generation pipelines are separate** — you can load both simultaneously if you have enough VRAM.
+11. **Increase `max_sequence_length`** in UltraGen if you use very detailed prompts or the Prompt Rewriter node (see below).
+
+### Extended Prompt Token Length (`max_sequence_length`)
+
+Most Qwen-Image ComfyUI workflows and the default diffusers pipeline hard-code the prompt token budget at 512 tokens. The UltraGen node exposes this as a configurable parameter (`max_sequence_length`, 128–1024) — a feature **not available in other Qwen-Image nodes or workflows**.
+
+**How it works:** After the Qwen2.5-VL text encoder produces token embeddings from your prompt, the sequence is truncated to `max_sequence_length` before being fed to the transformer. If your prompt is shorter than the limit, the extra positions are zero-padded and ignored via the attention mask — so there is no quality penalty for setting it higher than needed.
+
+| Consideration | Impact |
+|---------------|--------|
+| **Prompt fidelity** | Higher values preserve more detail from long prompts. At 512, prompts over ~200 words may be silently truncated. |
+| **Generation time** | Slightly more cross-attention compute per step. Negligible for most prompts — the image latent sequence dominates. |
+| **VRAM** | ~8 MB extra per batch item at 1024 vs 512 (trivial vs. the 38 GB transformer). |
+| **Quality** | No degradation — unused positions are masked out. |
+
+**Recommendation:** Leave at **512** for typical prompts. Increase to **768–1024** when using the Prompt Rewriter node or manually writing very detailed descriptions (300+ words). The maximum is 1024 (hard limit in the model architecture).
 
 ## Credits
 
 - **Qwen-Image-Edit / Qwen-Image**: Developed by Qwen Team (Alibaba)
+- **Wan2.1-VAE-upscale2x**: 2× super-resolution VAE by [spacepxl](https://huggingface.co/spacepxl) — model weights: [Apache-2.0](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x), reference code: [MIT](https://github.com/spacepxl/ComfyUI-VAE-Utils)
 - **Spectrum**: Han *et al.*, "Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration" (CVPR 2026)
 - **ComfyUI Nodes**: Eric Hiss (GitHub: [EricRollei](https://github.com/EricRollei))
 

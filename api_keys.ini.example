@@ -1,0 +1,25 @@
+; ═══════════════════════════════════════════════════════════════════════
+;  Eric Qwen Prompt Rewriter — API Key Configuration
+; ═══════════════════════════════════════════════════════════════════════
+;
+;  Copy this file to "api_keys.ini" and fill in your key(s).
+;  The api_keys.ini file is git-ignored and never saved in workflows.
+;
+;  The node auto-detects which key to use based on your API URL:
+;    - deepseek.com URLs → uses the [api_keys] deepseek key
+;    - openai.com  URLs → uses the [api_keys] openai  key
+;    - Other URLs       → uses the [api_keys] default key
+;
+;  You can also set environment variables instead of using this file:
+;    DEEPSEEK_API_KEY, OPENAI_API_KEY, or ERIC_QWEN_API_KEY
+;
+;  Environment variables take priority over this config file.
+; ═══════════════════════════════════════════════════════════════════════
+
+[api_keys]
+; Uncomment and set the key(s) for your API provider(s):
+
+; deepseek = sk-your-deepseek-api-key-here
+; openai = sk-your-openai-api-key-here
+; anthropic = sk-your-anthropic-api-key-here
+; default = your-fallback-api-key-here

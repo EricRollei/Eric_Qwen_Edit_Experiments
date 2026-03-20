@@ -22,8 +22,14 @@ build/
 .env
 .venv/
 
+# API keys (never commit real keys)
+api_keys.ini
+
 # Logs
 *.log
 
 # Private examples
 examples/not public/
+
+# Archives
+*.zip

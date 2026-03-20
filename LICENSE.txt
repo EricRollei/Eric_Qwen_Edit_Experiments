@@ -61,6 +61,19 @@ This project includes or depends on several third-party libraries and code, each
   - HuggingFace: <https://huggingface.co/Qwen/Qwen-Image-Edit-2511>, <https://huggingface.co/Qwen/Qwen-Image-2512>
   - The pipeline code in `pipelines/pipeline_qwen_edit.py` and `pipelines/pipeline_output.py` is derived from the HuggingFace Diffusers implementation of QwenImageEditPlusPipeline, licensed under Apache 2.0.
 
+### Wan2.1-VAE-upscale2x (2× Super-Resolution VAE)
+
+- **Model Weights**: Licensed under Apache 2.0
+  - Author: spacepxl
+  - HuggingFace: <https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x>
+  - A decoder-only finetune of the Wan2.1 VAE with 2× upscaling integrated into the decoder.
+
+- **ComfyUI-VAE-Utils** (reference implementation): Licensed under MIT License
+  - Author: spacepxl
+  - Repository: <https://github.com/spacepxl/ComfyUI-VAE-Utils>
+
+- The code in `nodes/eric_qwen_upscale_vae.py` is an independent implementation that loads and uses the above model weights via the HuggingFace Diffusers `AutoencoderKLWan` class. It does not contain code from ComfyUI-VAE-Utils, but was inspired by its approach.
+
 ### Spectrum Acceleration
 
 - **Spectrum**: Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration (CVPR 2026)

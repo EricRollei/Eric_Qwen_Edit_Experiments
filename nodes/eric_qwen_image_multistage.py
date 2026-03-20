@@ -9,8 +9,10 @@ Up to 3 stages with independent steps, CFG, and upscale ratios.
 Set upscale_to_stage2 = 0 to output Stage 1 only (single-stage).
 Set upscale_to_stage3 = 0 to stop after Stage 2 (two-stage).
 
-Latents are upscaled between stages via bicubic interpolation and
-re-noised according to per-stage denoise strength before re-sampling.
+Latents are upscaled between stages via bislerp (slerp-based
+interpolation that preserves vector norms and directions in latent
+space) and re-noised according to per-stage denoise strength before
+re-sampling.
 
 Model Credits:
 - Qwen-Image developed by Qwen Team (Alibaba)
@@ -64,15 +66,20 @@ def _upscale_latents(latents_packed: torch.Tensor,
                      src_h: int, src_w: int,
                      dst_h: int, dst_w: int,
                      vae_scale_factor: int) -> torch.Tensor:
-    """Unpack -> bicubic upscale -> repack latents."""
+    """Unpack -> bislerp upscale -> repack latents.
+
+    Uses ComfyUI's bislerp (slerp-interpolation) instead of bicubic.
+    Bislerp preserves vector norms and angular relationships between
+    latent channels, producing sharper and more coherent upscaled
+    latents compared to bicubic's independent-channel averaging.
+    """
+    import comfy.utils as comfy_utils
     spatial = _unpack_latents(latents_packed, src_h, src_w, vae_scale_factor)
     b, c, _one, h_lat, w_lat = spatial.shape
     dst_h_lat = 2 * (int(dst_h) // (vae_scale_factor * 2))
     dst_w_lat = 2 * (int(dst_w) // (vae_scale_factor * 2))
     spatial_4d = spatial.squeeze(2)  # (B, C, H, W)
-    upscaled = torch.nn.functional.interpolate(
-        spatial_4d, size=(dst_h_lat, dst_w_lat), mode="bicubic", align_corners=False
-    )
+    upscaled = comfy_utils.bislerp(spatial_4d, dst_w_lat, dst_h_lat)
     upscaled = upscaled.unsqueeze(2)  # (B, C, 1, H', W')
     return _pack_latents(upscaled)
 
@@ -148,6 +155,96 @@ def _compute_actual_start_sigma(
         sigmas = 1.0 - (one_minus_z / scale_factor)
 
     return float(sigmas[0])
+
+
+def build_sigma_schedule(num_steps: int, denoise: float,
+                         schedule: str = "linear",
+                         power: float = 1.0) -> list:
+    """Build a sigma schedule for flow-matching partial denoise.
+
+    The schedule defines the **spacing** of sigma values within the active
+    denoise range.  All schedules start from the same sigma (determined by
+    ``denoise``) and end at the same ``sigma_min`` — they only differ in
+    how steps are distributed within that range.
+
+    Schedules
+    ---------
+    linear
+        Uniform spacing.  Safe default.  Equal compute at every noise level.
+    balanced
+        Karras-style with ρ=3.  Moderately concentrates steps at mid-to-low
+        sigma — reduces time spent on composition (high sigma) while giving
+        balanced coverage to detail and fine texture.  **Recommended for S2.**
+    karras
+        Karras-style with ρ=7 (EDM-optimal).  Heavily concentrates steps at
+        low sigma (fine detail/sharpening), with large jumps through high
+        sigma.  **Recommended for S3.**
+
+    Step budget distribution (S2 example: 30 steps, denoise=0.85):
+
+        Schedule  │ HIGH σ (composition)  │ MID σ (detail)  │ LOW σ (texture)
+        ──────────┼───────────────────────┼─────────────────┼────────────────
+        linear    │ 46%                   │ 38%             │ 15%
+        balanced  │ 27%                   │ 38%             │ 35%
+        karras    │ 23%                   │ 35%             │ 42%
+
+    Denoise
+    -------
+    When ``denoise < 1.0``, the schedule covers only the lower portion of
+    the sigma range (from ``sigma_start`` down to ``sigma_min``), with
+    ``keep = round(num_steps * denoise)`` steps.  ``sigma_start`` is the
+    same value linear truncation would produce, ensuring all schedules have
+    a consistent noise level regardless of curve shape.
+
+    Args:
+        num_steps: Total number of denoising steps.
+        denoise:   Fraction of schedule to use (1.0 = full, <1 = partial).
+        schedule:  ``"linear"``, ``"balanced"``, or ``"karras"``.
+        power:     Reserved for future use.
+
+    Returns:
+        List of sigma values (descending), length = ``keep``.
+    """
+    sigma_max = 1.0
+    sigma_min = 1.0 / num_steps
+
+    if denoise >= 1.0:
+        keep = num_steps
+        sigma_start = sigma_max
+    else:
+        keep = max(1, int(round(num_steps * denoise)))
+        # Compute starting sigma from the linear schedule so ALL schedule
+        # types begin at the same noise level for a given denoise value.
+        # This was the root cause of the "echo/ghosting" bug: cosine and
+        # karras had wildly different starting sigmas after truncation.
+        full_linear = np.linspace(sigma_max, sigma_min, num_steps)
+        sigma_start = float(full_linear[num_steps - keep])
+
+    # Distribute 'keep' steps from sigma_start to sigma_min
+    t = np.linspace(0.0, 1.0, keep)
+
+    if schedule == "balanced":
+        # Karras-style with ρ=3 — moderate concentration at low sigma.
+        # Reduces high-sigma (composition) steps while giving balanced
+        # coverage to mid (detail) + low (fine texture) ranges.
+        rho = 3.0
+        sigmas = (
+            sigma_start ** (1.0 / rho)
+            + t * (sigma_min ** (1.0 / rho) - sigma_start ** (1.0 / rho))
+        ) ** rho
+    elif schedule == "karras":
+        # EDM-optimal (Karras et al., NeurIPS 2022) with ρ=7.
+        # Heavy concentration at low sigma — best for fine detail stages.
+        rho = 7.0
+        sigmas = (
+            sigma_start ** (1.0 / rho)
+            + t * (sigma_min ** (1.0 / rho) - sigma_start ** (1.0 / rho))
+        ) ** rho
+    else:  # "linear" (default)
+        sigmas = np.linspace(sigma_start, sigma_min, keep)
+
+    sigmas = np.clip(sigmas, sigma_min, sigma_start)
+    return sigmas.tolist()
 
 
 # ═══════════════════════════════════════════════════════════════════════

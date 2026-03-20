@@ -23,6 +23,10 @@ from .eric_qwen_image_component_loader import EricQwenImageComponentLoader
 from .eric_qwen_image_generate import EricQwenImageGenerate
 from .eric_qwen_image_lora import EricQwenImageApplyLoRA, EricQwenImageUnloadLoRA
 from .eric_qwen_image_multistage import EricQwenImageMultiStage
+from .eric_qwen_image_ultragen import EricQwenImageUltraGen
+from .eric_qwen_image_spectrum import EricQwenImageSpectrum
+from .eric_qwen_prompt_rewriter import EricQwenPromptRewriter
+from .eric_qwen_upscale_vae import EricQwenUpscaleVAELoader
 
 NODE_CLASS_MAPPINGS = {
     # Edit
@@ -47,6 +51,11 @@ NODE_CLASS_MAPPINGS = {
     "Eric Qwen-Image Apply LoRA": EricQwenImageApplyLoRA,
     "Eric Qwen-Image Unload LoRA": EricQwenImageUnloadLoRA,
     "Eric Qwen-Image Multi-Stage": EricQwenImageMultiStage,
+    "Eric Qwen-Image UltraGen": EricQwenImageUltraGen,
+    "Eric Qwen-Image Spectrum": EricQwenImageSpectrum,
+    "Eric Qwen Prompt Rewriter": EricQwenPromptRewriter,
+    # Utility
+    "Eric Qwen Upscale VAE Loader": EricQwenUpscaleVAELoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -72,4 +81,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Eric Qwen-Image Apply LoRA": "Eric Qwen-Image Apply LoRA",
     "Eric Qwen-Image Unload LoRA": "Eric Qwen-Image Unload LoRA",
     "Eric Qwen-Image Multi-Stage": "Eric Qwen-Image Multi-Stage Generate",
+    "Eric Qwen-Image UltraGen": "Eric Qwen-Image UltraGen",
+    "Eric Qwen-Image Spectrum": "Eric Qwen-Image Spectrum Accelerator",
+    "Eric Qwen Prompt Rewriter": "Eric Qwen Prompt Rewriter",
+    # Utility
+    "Eric Qwen Upscale VAE Loader": "Eric Qwen Upscale VAE Loader (2×)",
 }
