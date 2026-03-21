@@ -75,6 +75,14 @@ class EricQwenEditApplyLoRA:
     - 0.0 = no effect (disabled)
     - >1.0 = amplified (may cause artifacts)
     
+    Per-stage weights (for UltraGen multi-stage generation):
+    - weight_stage1/2/3 override the global weight for each UltraGen stage
+    - Default -1 = use global weight for that stage
+    - 0.0 = disable this LoRA for that stage
+    - Example: detail LoRA at [0, 0.8, 1.0] — no detail in draft, full in polish
+    - Example: lightning LoRA at [0.5, 1.0, 0] — skip the fast-LoRA in the short final stage
+    - Non-UltraGen nodes ignore these and use the global weight
+    
     LoRAs are loaded from ComfyUI's standard loras folder:
     ComfyUI/models/loras/
     """
@@ -105,6 +113,27 @@ class EricQwenEditApplyLoRA:
                     "default": "",
                     "tooltip": "Optional: Override with custom path (leave empty to use dropdown)"
                 }),
+                "weight_stage1": ("FLOAT", {
+                    "default": -1.0,
+                    "min": -1.0,
+                    "max": 2.0,
+                    "step": 0.05,
+                    "tooltip": "UltraGen Stage 1 (draft) weight. -1 = use global weight. 0 = disabled for this stage."
+                }),
+                "weight_stage2": ("FLOAT", {
+                    "default": -1.0,
+                    "min": -1.0,
+                    "max": 2.0,
+                    "step": 0.05,
+                    "tooltip": "UltraGen Stage 2 (refine) weight. -1 = use global weight. 0 = disabled for this stage."
+                }),
+                "weight_stage3": ("FLOAT", {
+                    "default": -1.0,
+                    "min": -1.0,
+                    "max": 2.0,
+                    "step": 0.05,
+                    "tooltip": "UltraGen Stage 3 (polish) weight. -1 = use global weight. 0 = disabled for this stage."
+                }),
             }
         }
     
@@ -119,6 +148,9 @@ class EricQwenEditApplyLoRA:
         lora_name: str,
         weight: float = 1.0,
         lora_path_override: str = "",
+        weight_stage1: float = -1.0,
+        weight_stage2: float = -1.0,
+        weight_stage3: float = -1.0,
     ) -> Tuple[dict]:
         """Apply LoRA to the pipeline."""
         pipe = pipeline["pipeline"]
@@ -177,7 +209,18 @@ class EricQwenEditApplyLoRA:
             "path": lora_path,
             "weight": weight,
             "filename": lora_filename,
+            "weight_stage1": weight_stage1,
+            "weight_stage2": weight_stage2,
+            "weight_stage3": weight_stage3,
         }
+
+        # Log per-stage weights if any are customized
+        stage_custom = any(w >= 0 for w in [weight_stage1, weight_stage2, weight_stage3])
+        if stage_custom:
+            s1 = weight if weight_stage1 < 0 else weight_stage1
+            s2 = weight if weight_stage2 < 0 else weight_stage2
+            s3 = weight if weight_stage3 < 0 else weight_stage3
+            print(f"[EricQwenEdit] Per-stage weights: S1={s1}, S2={s2}, S3={s3}")
         
         # Return the same pipeline dict (modified in place)
         return (pipeline,)

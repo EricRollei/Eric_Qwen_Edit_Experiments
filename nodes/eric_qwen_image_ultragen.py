@@ -56,6 +56,36 @@ from .eric_qwen_upscale_vae import (
 )
 
 
+def _apply_lora_stage_weights(pipe, pipeline: dict, stage: int) -> None:
+    """Set LoRA adapter weights for the given UltraGen stage (1, 2, or 3).
+
+    Reads ``pipeline["applied_loras"]`` and calls ``pipe.set_adapters()``
+    with the per-stage weight for each loaded adapter.  If no per-stage
+    weight was configured (value < 0), the global ``weight`` is used.
+
+    This is a no-op when no LoRAs are applied.
+    """
+    applied_loras = pipeline.get("applied_loras")
+    if not applied_loras:
+        return
+
+    stage_key = f"weight_stage{stage}"  # e.g. "weight_stage2"
+    names = []
+    weights = []
+    for adapter_name, info in applied_loras.items():
+        stage_w = info.get(stage_key, -1.0)
+        effective_w = info["weight"] if stage_w < 0 else stage_w
+        names.append(adapter_name)
+        weights.append(effective_w)
+
+    try:
+        pipe.set_adapters(names, adapter_weights=weights)
+        summary = ", ".join(f"{n}={w}" for n, w in zip(names, weights))
+        print(f"[UltraGen] Stage {stage} LoRA weights: {summary}")
+    except Exception as e:
+        print(f"[UltraGen] WARNING: Could not set stage {stage} LoRA weights: {e}")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Official Qwen-Image-2512 recommended resolutions (~1.76 MP)
 #  Source: https://github.com/QwenLM/Qwen-Image Quick Start
@@ -549,6 +579,8 @@ class EricQwenImageUltraGen:
             _check_cancelled()
             print(f"[UltraGen] -- Stage 1/{stage_count} --")
 
+            _apply_lora_stage_weights(pipe, pipeline, stage=1)
+
             s1_output_type = "latent" if (do_stage2 or use_final_decode) else "pil"
             s1_result = pipe(
                 prompt=prompt,
@@ -603,6 +635,8 @@ class EricQwenImageUltraGen:
             # ════════════════════════════════════════════════════════════
             _check_cancelled()
             print(f"[UltraGen] -- Stage 2/{stage_count} --")
+
+            _apply_lora_stage_weights(pipe, pipeline, stage=2)
 
             s2_latents = _upscale_latents(
                 s1_latents, s1_h, s1_w, s2_h, s2_w, vae_scale_factor
@@ -664,6 +698,8 @@ class EricQwenImageUltraGen:
             # ════════════════════════════════════════════════════════════
             _check_cancelled()
             print(f"[UltraGen] -- Stage 3/{stage_count} --")
+
+            _apply_lora_stage_weights(pipe, pipeline, stage=3)
 
             if use_inter_stage:
                 # Decode S2 latents at 2× with upscale VAE, re-encode
