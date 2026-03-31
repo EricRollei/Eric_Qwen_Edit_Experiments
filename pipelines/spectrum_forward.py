@@ -93,6 +93,8 @@ def _qwen_spectrum_forward(
     txt_seq_lens: Optional[List[int]] = None,
     guidance: torch.Tensor = None,
     attention_kwargs: Optional[Dict[str, Any]] = None,
+    controlnet_block_samples=None,
+    additional_t_cond=None,
     return_dict: bool = True,
 ) -> Union[torch.Tensor, Transformer2DModelOutput]:
     """
@@ -106,6 +108,11 @@ def _qwen_spectrum_forward(
     postamble (``norm_out``, ``proj_out``) always run because they depend
     on the current timestep / latent input and are negligible cost
     compared to the 60-block loop.
+
+    Note: ``controlnet_block_samples`` is accepted for API compatibility
+    but Spectrum caching is incompatible with ControlNet — cached steps
+    would skip the block loop and ignore CN residuals.  The UltraGen CN
+    node disables Spectrum for ControlNet stages.
     """
     # ---- LoRA bookkeeping (same as original) ----
     if attention_kwargs is not None:
@@ -166,6 +173,13 @@ def _qwen_spectrum_forward(
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=attention_kwargs,
                 )
+            # ControlNet residual (same logic as original transformer forward)
+            if controlnet_block_samples is not None:
+                import numpy as np
+                interval_control = len(self.transformer_blocks) / len(controlnet_block_samples)
+                interval_control = int(np.ceil(interval_control))
+                hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
+
         # Update forecaster with the real output
         forecaster.update(float(self._spectrum_step_idx), hidden_states)
         self._spectrum_actual_count += 1

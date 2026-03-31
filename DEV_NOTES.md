@@ -284,4 +284,4 @@ Final stage packed latents (output_type="latent")
 
 ---
 
-*Last updated: March 19, 2026 — Eric Hiss*
+*Last updated: March 23, 2026 — Eric Hiss*

@@ -25,7 +25,12 @@ from .eric_qwen_image_lora import EricQwenImageApplyLoRA, EricQwenImageUnloadLoR
 from .eric_qwen_image_multistage import EricQwenImageMultiStage
 from .eric_qwen_image_ultragen import EricQwenImageUltraGen
 from .eric_qwen_image_spectrum import EricQwenImageSpectrum
+from .eric_qwen_image_controlnet_loader import EricQwenImageControlNetLoader, EricQwenImageControlNetUnload
+from .eric_qwen_image_ultragen_cn import EricQwenImageUltraGenCN
+from .eric_qwen_image_ultragen_inpaint_cn import EricQwenImageUltraGenInpaintCN
 from .eric_qwen_prompt_rewriter import EricQwenPromptRewriter
+from .eric_qwen_inpaint_prompt_rewriter import EricQwenInpaintPromptRewriter
+from .eric_qwen_controlnet_prompt_rewriter import EricQwenControlNetPromptRewriter
 from .eric_qwen_upscale_vae import EricQwenUpscaleVAELoader
 
 NODE_CLASS_MAPPINGS = {
@@ -53,7 +58,13 @@ NODE_CLASS_MAPPINGS = {
     "Eric Qwen-Image Multi-Stage": EricQwenImageMultiStage,
     "Eric Qwen-Image UltraGen": EricQwenImageUltraGen,
     "Eric Qwen-Image Spectrum": EricQwenImageSpectrum,
+    "Eric Qwen-Image ControlNet Loader": EricQwenImageControlNetLoader,
+    "Eric Qwen-Image ControlNet Unload": EricQwenImageControlNetUnload,
+    "Eric Qwen-Image UltraGen CN": EricQwenImageUltraGenCN,
+    "Eric Qwen-Image UltraGen Inpaint CN": EricQwenImageUltraGenInpaintCN,
     "Eric Qwen Prompt Rewriter": EricQwenPromptRewriter,
+    "Eric Qwen Inpaint Prompt Rewriter": EricQwenInpaintPromptRewriter,
+    "Eric Qwen ControlNet Prompt Rewriter": EricQwenControlNetPromptRewriter,
     # Utility
     "Eric Qwen Upscale VAE Loader": EricQwenUpscaleVAELoader,
 }
@@ -83,7 +94,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Eric Qwen-Image Multi-Stage": "Eric Qwen-Image Multi-Stage Generate",
     "Eric Qwen-Image UltraGen": "Eric Qwen-Image UltraGen",
     "Eric Qwen-Image Spectrum": "Eric Qwen-Image Spectrum Accelerator",
+    "Eric Qwen-Image ControlNet Loader": "Eric Qwen-Image ControlNet Loader",
+    "Eric Qwen-Image ControlNet Unload": "Eric Qwen-Image ControlNet Unload",
+    "Eric Qwen-Image UltraGen CN": "Eric Qwen-Image UltraGen (ControlNet)",
+    "Eric Qwen-Image UltraGen Inpaint CN": "Eric Qwen-Image UltraGen Inpaint (ControlNet)",
     "Eric Qwen Prompt Rewriter": "Eric Qwen Prompt Rewriter",
+    "Eric Qwen Inpaint Prompt Rewriter": "Eric Qwen Inpaint Prompt Rewriter (Vision)",
+    "Eric Qwen ControlNet Prompt Rewriter": "Eric Qwen ControlNet Prompt Rewriter (Vision)",
     # Utility
     "Eric Qwen Upscale VAE Loader": "Eric Qwen Upscale VAE Loader (2×)",
 }

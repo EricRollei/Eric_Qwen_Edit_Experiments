@@ -188,6 +188,82 @@ SYSTEM_PROMPT_ZH = """你是一位世界顶级的图像Prompt改写专家。你�
 #  API helper
 # ═══════════════════════════════════════════════════════════════════════
 
+def _parse_sse_content(raw: str) -> str:
+    """Extract content from SSE (Server-Sent Events) streaming response.
+
+    Handles the case where the server ignores stream:false and sends
+    chunked SSE data instead of a single JSON response.
+    """
+    content_parts = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        data_str = line[6:]  # Strip 'data: ' prefix
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            piece = delta.get("content", "")
+            if piece:
+                content_parts.append(piece)
+        except (json.JSONDecodeError, IndexError, KeyError):
+            continue
+    return "".join(content_parts)
+
+
+def _resolve_model_name(api_url: str, requested_model: str) -> str:
+    """Query the API server for loaded models and resolve the actual name.
+
+    If the requested model is found, use it.  Otherwise pick the first
+    loaded model and warn.  Returns the original name on any error.
+    """
+    url = api_url.rstrip("/")
+    if url.endswith("/chat/completions"):
+        url = url.rsplit("/chat/completions", 1)[0]
+    if not url.endswith("/v1"):
+        url += "/v1"
+    models_url = url + "/models"
+
+    try:
+        req = urllib.request.Request(models_url, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            model_ids = [m["id"] for m in data.get("data", [])]
+
+            if not model_ids:
+                print(f"[EricQwenPrompt] No models reported by {models_url}")
+                return requested_model
+
+            print(f"[EricQwenPrompt] Server has {len(model_ids)} model(s) "
+                  f"available")
+
+            if requested_model in model_ids:
+                return requested_model
+
+            # Try partial match
+            for mid in model_ids:
+                if requested_model.lower() in mid.lower():
+                    print(f"[EricQwenPrompt] Partial match: "
+                          f"'{requested_model}' -> '{mid}'")
+                    return mid
+
+            # Not found — use first available
+            fallback = model_ids[0]
+            print(f"[EricQwenPrompt] WARNING: Model '{requested_model}' "
+                  f"not found on server.")
+            print(f"[EricQwenPrompt] Available: "
+                  f"{', '.join(model_ids[:5])}"
+                  f"{'...' if len(model_ids) > 5 else ''}")
+            print(f"[EricQwenPrompt] Using: '{fallback}'")
+            return fallback
+
+    except Exception as e:
+        print(f"[EricQwenPrompt] Could not query models endpoint: {e}")
+        return requested_model
+
+
 def _call_openai_compatible(
     api_url: str,
     model: str,
@@ -204,8 +280,12 @@ def _call_openai_compatible(
     Uses only stdlib (urllib) to avoid extra dependencies.
 
     Handles DeepSeek thinking-model responses where reasoning_content
-    consumes part of the token budget.
+    consumes part of the token budget.  Falls back to SSE streaming
+    parse if server ignores stream:false.
     """
+    # Resolve actual model name (handles 404 from unloaded models)
+    model = _resolve_model_name(api_url, model)
+
     # Normalize URL — ensure it ends with /chat/completions
     url = api_url.rstrip("/")
     if not url.endswith("/chat/completions"):
@@ -222,6 +302,7 @@ def _call_openai_compatible(
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "stream": False,
     }
 
     headers = {
@@ -250,21 +331,49 @@ def _call_openai_compatible(
 
     try:
         with opener.open(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            message = body["choices"][0]["message"]
-            content = message.get("content", "").strip()
+            raw = resp.read().decode("utf-8")
 
-            # DeepSeek thinking models may return reasoning_content
-            # separately — log it but use the main content field
-            reasoning = message.get("reasoning_content", "")
-            if reasoning:
-                logger.info(f"DeepSeek reasoning tokens used: {len(reasoning)} chars")
+            # Try standard JSON parse first
+            try:
+                body = json.loads(raw)
+                message = body["choices"][0]["message"]
+                content = message.get("content", "").strip()
 
-            return content
+                # DeepSeek thinking models may return reasoning_content
+                # separately — log it but use the main content field
+                reasoning = message.get("reasoning_content", "")
+                if reasoning:
+                    logger.info(f"DeepSeek reasoning tokens used: "
+                                f"{len(reasoning)} chars")
+
+                if content:
+                    return content
+                # Some models put content in reasoning_content only
+                if reasoning:
+                    return reasoning.strip()
+            except (json.JSONDecodeError, KeyError, IndexError) as parse_err:
+                print(f"[EricQwenPrompt] JSON parse failed: {parse_err}")
+                print(f"[EricQwenPrompt] Raw response (first 500): "
+                      f"{raw[:500]}")
+
+            # Fallback: try parsing as SSE streaming data
+            if "data: " in raw:
+                print("[EricQwenPrompt] Attempting SSE stream parse...")
+                content = _parse_sse_content(raw)
+                if content:
+                    print(f"[EricQwenPrompt] SSE parse recovered "
+                          f"{len(content)} chars")
+                    return content.strip()
+
+            raise RuntimeError(
+                f"Could not extract content from API response. "
+                f"Raw ({len(raw)} bytes): {raw[:500]}"
+            )
+
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(
-            f"Prompt rewrite API error {e.code}: {error_body}"
+            f"Prompt rewrite API error {e.code}: {error_body[:500]}"
         ) from e
     except urllib.error.URLError as e:
         raise RuntimeError(
@@ -305,26 +414,27 @@ class EricQwenPromptRewriter:
                     "tooltip": "Original image description to enhance"
                 }),
                 "api_url": ("STRING", {
-                    "default": "http://localhost:11434/v1",
+                    "default": "http://localhost:1234/v1",
                     "tooltip": (
                         "OpenAI-compatible API base URL. Examples:\n"
-                        "  Ollama: http://localhost:11434/v1\n"
                         "  LM Studio: http://localhost:1234/v1\n"
+                        "  Ollama: http://localhost:11434/v1\n"
                         "  DeepSeek: https://api.deepseek.com/v1\n"
                         "  OpenAI: https://api.openai.com/v1"
                     )
                 }),
+            },
+            "optional": {
                 "model": ("STRING", {
-                    "default": "qwen3:8b",
+                    "default": "",
                     "tooltip": (
-                        "Model name on the API server. Examples:\n"
+                        "Model name override. Leave empty to auto-detect\n"
+                        "the loaded model from the API server.\n"
                         "  Ollama: qwen3:8b, llama3.1:8b\n"
                         "  DeepSeek: deepseek-chat\n"
                         "  OpenAI: gpt-4o-mini"
                     )
                 }),
-            },
-            "optional": {
                 "language": (["English", "Chinese"], {
                     "default": "English",
                     "tooltip": "Language for the rewritten prompt"
@@ -366,8 +476,8 @@ class EricQwenPromptRewriter:
     def rewrite(
         self,
         prompt: str,
-        api_url: str = "http://localhost:11434/v1",
-        model: str = "qwen3:8b",
+        api_url: str = "http://localhost:1234/v1",
+        model: str = "",
         language: str = "English",
         temperature: float = 0.7,
         max_tokens: int = 2048,

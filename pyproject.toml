@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-eric-qwen-edit"
-version = "2.0.0"
-description = "ComfyUI nodes for Qwen-Image-Edit and Qwen-Image — 24 nodes for editing, generation, multi-stage, LoRA, Spectrum acceleration, prompt rewriting, and 2× upscale VAE"
+version = "3.0.0"
+description = "ComfyUI nodes for Qwen-Image-Edit and Qwen-Image — 30 nodes for editing, generation, multi-stage, LoRA, Spectrum acceleration, ControlNet-guided generation, prompt rewriting, and 2× upscale VAE"
 readme = "README.md"
 license = { file = "LICENSE.txt" }
 requires-python = ">=3.10"

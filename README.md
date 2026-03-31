@@ -3,7 +3,7 @@
 ## 🖼️ Up to 17 MP image editing · 50 MP+ text-to-image generation
 
 ComfyUI custom nodes for **Qwen-Image-Edit-2511** (image editing) and **Qwen-Image-2512** (text-to-image generation) — 20-billion-parameter MMDiT models by Qwen (Alibaba).  
-24 nodes covering loading, single-image editing, multi-image fusion, style transfer, inpainting, inpaint-with-transfer, LoRA, Spectrum acceleration, delta overlay, mask utilities, **text-to-image generation**, multi-stage generation, prompt rewriting, and **2× VAE super-resolution upscaling**.
+30 nodes covering loading, single-image editing, multi-image fusion, style transfer, inpainting, inpaint-with-transfer, LoRA, Spectrum acceleration, delta overlay, mask utilities, **text-to-image generation**, multi-stage generation, prompt rewriting, **2× VAE super-resolution upscaling**, **ControlNet-guided generation**, and **ControlNet inpainting** *(experimental)*.
 
 ![8 MP image editing in just a few nodes](examples/FireRed11-8mp.png)
 *Edit images at full 8 MP resolution — just a loader, LoRA, and edit node.*
@@ -20,6 +20,7 @@ ComfyUI custom nodes for **Qwen-Image-Edit-2511** (image editing) and **Qwen-Ima
 - **Dual conditioning paths** — VL path (~384 px semantic tokens via Qwen2.5-VL) + VAE/ref path (output-resolution pixel latents), individually controllable per image (edit nodes)
 - **Multi-stage generation** — Progressive upscale + re-denoise across up to 3 stages with per-stage control over steps, CFG, denoise, and sigma schedule
 - **UltraGen** — Quality-focused v2 multi-stage node with Qwen-Image-2512 best practices, per-stage seeds, sigma schedules, and upscale VAE integration
+- **ControlNet-guided generation** — UltraGen CN node with [InstantX/Qwen-Image-ControlNet-Union](https://huggingface.co/InstantX/Qwen-Image-ControlNet-Union) for Canny, SoftEdge, Depth, and Pose guided generation up to 50 MP+, with auto-scaling CN strength
 - **Spectrum acceleration** — Training-free CVPR 2026 Chebyshev feature forecaster for ~3–5× speedup (both edit and generation)
 - **Prompt rewriting** — Local or remote LLM-powered prompt enhancement via any OpenAI-compatible API (Ollama, LM Studio, DeepSeek, etc.)
 - **LoRA support** — Apply and unload LoRAs on both edit and generation pipelines with chainable weight control
@@ -119,6 +120,9 @@ git clone https://github.com/EricRollei/Eric_Qwen_Edit_Experiments.git
 - **Upscale VAE** *(optional)*: spacepxl/Wan2.1-VAE-upscale2x (~0.5 GB)
   - https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x
   - Only needed for the 2× VAE super-resolution feature in UltraGen
+- **ControlNet** *(optional)*: InstantX/Qwen-Image-ControlNet-Union (~2.3 GB)
+  - https://huggingface.co/InstantX/Qwen-Image-ControlNet-Union
+  - Canny, SoftEdge, Depth, Pose guided generation
 - **VRAM**:
   - 24 GB for up to 2 MP
   - 48 GB for up to 6 MP
@@ -660,6 +664,54 @@ Quality-focused multi-stage text-to-image generation (v2). Incorporates all Qwen
 
 ---
 
+### Eric Qwen-Image ControlNet Loader
+
+Loads an InstantX Qwen-Image ControlNet model. Supports both the **Union** model (Canny, SoftEdge, Depth, Pose) and the **Inpainting** model. The model is kept on CPU and moved to GPU automatically when called by UltraGen CN or UltraGen Inpaint CN.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model_path` | STRING | `InstantX/Qwen-Image-ControlNet-Union` | HuggingFace model ID or local path |
+| `dtype` | COMBO | `bfloat16` | Model precision: bfloat16, float16, float32 |
+
+**Output:** `QWEN_IMAGE_CONTROLNET`
+
+> **Models:**
+> - [InstantX/Qwen-Image-ControlNet-Union](https://huggingface.co/InstantX/Qwen-Image-ControlNet-Union) — Canny, SoftEdge, Depth, Pose (recommended for generation)
+> - [InstantX/Qwen-Image-ControlNet-Inpainting](https://huggingface.co/InstantX/Qwen-Image-ControlNet-Inpainting) — Mask-based inpainting (experimental, see below)
+
+---
+
+### Eric Qwen-Image UltraGen CN
+
+ControlNet-guided multi-stage text-to-image generation. Same architecture as UltraGen but uses the [InstantX/Qwen-Image-ControlNet-Union](https://huggingface.co/InstantX/Qwen-Image-ControlNet-Union) model on Stage 1 (and optionally Stage 2) to guide composition and structure from a control image. Supports Canny edge maps, SoftEdge/HED, depth maps, and OpenPose skeletons. Output up to **50 MP+** with upscale VAE.
+
+Includes ControlNet auto-scaling that calibrates CN signal magnitude to match the transformer's hidden states, so the same `cn_target_strength` value works across different fine-tuned transformers without manual scale hunting.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pipeline` | QWEN_IMAGE_PIPELINE | — | From any generation loader node |
+| `controlnet` | QWEN_IMAGE_CONTROLNET | — | From the ControlNet Loader |
+| `control_image` | IMAGE | — | Control image (Canny, depth, pose, or soft edge map) |
+| `cn_type` | COMBO | `canny` | ControlNet type: `canny`, `soft_edge`, `depth`, `pose` |
+| `prompt` | STRING | — | Describe the image |
+| `negative_prompt` | STRING | *(official default)* | Negative prompt |
+| **ControlNet** | | | |
+| `cn_auto_scale` | BOOLEAN | `True` | Auto-calibrate CN strength to transformer magnitude |
+| `cn_target_strength` | FLOAT | `1.0` | CN influence (1.0 = standard, higher = stronger guidance) |
+| `controlnet_conditioning_scale` | FLOAT | `1.0` | Manual CN scale (when auto-scale OFF) |
+| `control_guidance_start` | FLOAT | `0.0` | When CN guidance begins (fraction of steps) |
+| `control_guidance_end` | FLOAT | `1.0` | When CN guidance ends |
+| **S2 ControlNet** | | | |
+| `s2_cn_scale` | FLOAT | `1.0` | CN strength on Stage 2 (0 = disable CN for S2) |
+| `s2_cn_start` | FLOAT | `0.0` | S2 CN guidance start |
+| `s2_cn_end` | FLOAT | `1.0` | S2 CN guidance end |
+| **Stages** | | | *(Same stage parameters as UltraGen — s1_mp, s1_steps, s1_cfg, upscale_to_stage2, s2_steps, etc.)* |
+| **Upscale VAE** | | | *(Same upscale VAE parameters as UltraGen)* |
+
+**Output:** `IMAGE`
+
+---
+
 ### Eric Qwen-Image Spectrum Accelerator
 
 Training-free diffusion sampling speedup using adaptive spectral feature forecasting (CVPR 2026). Predicts transformer outputs on skipped steps via Chebyshev polynomial regression instead of running all transformer blocks. Best for ≥20 inference steps and true CFG runs (2× transformer passes per step → double the savings). Wire between the Image Loader and any generation node.
@@ -696,6 +748,37 @@ Enhance image prompts using a local or remote LLM. Rewrites terse prompts into r
 | `passthrough` | BOOLEAN | `False` | Skip rewriting and pass prompt through unchanged (for A/B testing) |
 
 **Output:** `enhanced_prompt` (STRING)
+
+---
+
+## ⚠️ Experimental: ControlNet Inpainting Nodes
+
+> **Motivation:** Qwen-Image-Edit redraws the *entire* image on every edit, which progressively degrades areas outside the edit region — fine details, textures, and sharpness are lost across the whole canvas. A true inpainting pipeline would regenerate *only* the masked region while leaving the rest of the image completely untouched, preserving full original quality. That is the goal of these ControlNet inpainting nodes.
+>
+> **Status: Experimental — not fully working.** These nodes are functional but produce visible halos and ghosting artifacts from double-sampling at mask boundaries. The multi-stage pipeline generates the full image from noise while the ControlNet conditions on the masked source, but compositing the result back onto the original creates noticeable seams that the harmonization pass has not yet fully resolved. We believe techniques from the Qwen-Edit inpaint nodes (which use a fundamentally different conditioning approach) may help, but this has not been explored yet.
+>
+> **Alternative:** The **Eric Qwen-Edit Inpaint** node provides a separate experimental approach to masked inpainting using the Qwen-Image-Edit model. It blanks out the masked region before sending the image through both the VL and VAE encoders, then composites the generated output back onto the original using the mask with edge feathering. This approach currently produces better results than the ControlNet inpainting nodes, though it still relies on Qwen-Edit (which reprocesses the full image internally) and is itself experimental.
+>
+> These nodes are included for experimentation.
+
+### Eric Qwen-Image UltraGen Inpaint CN
+
+ControlNet-guided multi-stage inpainting and outpainting using the [InstantX/Qwen-Image-ControlNet-Inpainting](https://huggingface.co/InstantX/Qwen-Image-ControlNet-Inpainting) model. Uses `QwenImageControlNetInpaintPipeline` with 17-channel conditioning (16ch VAE-encoded masked image + 1ch mask). Supports object replacement, background replacement, text modification, and outpainting.
+
+**Architecture:** Up to 3 stages — S1 (CN draft), S2A (CN refine + dilated mask), S2B (whole-image harmonize, no CN), S3 (polish upscale, no CN). Smart stage selection (`auto_stages`) skips S1 when input is already large enough. Final feathered composite preserves original pixels outside the mask.
+
+**Known issues:**
+- Halo artifacts at mask boundaries due to double-sampling
+- Ghosting where generated content overlaps original pixels
+- Harmonization pass (S2B) reduces but does not eliminate boundary artifacts
+
+### Eric Qwen Inpaint Prompt Rewriter
+
+VLM-powered prompt rewriter for inpainting. Analyzes the source image and mask to generate short, change-focused prompts (40–80 words) describing the desired edit. Uses mask outline overlay for spatial awareness.
+
+### Eric Qwen ControlNet Prompt Rewriter
+
+VLM-powered prompt rewriter for ControlNet-guided generation. Generates full scene descriptions (200–400 words) with CN-type awareness (Canny, SoftEdge, Depth, Pose). Outputs both the prompt and a `cn_type_index` integer.
 
 ---
 
@@ -764,13 +847,27 @@ Most multi-image nodes expose per-image `vl_*` and `ref_*` toggles so you can co
 
 ## Example Workflows
 
-### Simple Qwen Edit
+All workflow PNGs below have the full ComfyUI workflow embedded — drag them directly into ComfyUI to load.
 
-A minimal workflow showing how easy it is to get started — loader → LoRA → edit node → output.
+### Qwen-Edit Hi-Res — Simple
 
-![Simple Qwen Edit workflow](examples/Simple_Qwen_edit.png)
+A minimal editing workflow: loader → LoRA → edit node → output. Quick to set up and great for getting started.
 
-See the `examples/` folder for workflow files and screenshots.
+![Qwen-Edit Hi-Res Simple workflow](workflows/Qwen-Edit-HiRes-Simple.png)
+
+### Qwen-Edit Hi-Res — Advanced
+
+A full-featured editing workflow with multi-stage generation, Spectrum acceleration, upscale VAE, and fine-grained stage controls.
+
+![Qwen-Edit Hi-Res Advanced workflow](workflows/Qwen-Edit-HiRes-Adv.png)
+
+### Qwen-Image Hi-Res with ControlNet
+
+Text-to-image generation guided by ControlNet (Canny, SoftEdge, Depth, or Pose) using the InstantX Union model, with multi-stage UltraGen upscaling.
+
+![Qwen-Image Hi-Res ControlNet workflow](workflows/Qwen-Image-HiRes-Controlnet.png)
+
+See the `examples/` and `workflows/` folders for additional workflow files and screenshots.
 
 ## Example Prompts
 
