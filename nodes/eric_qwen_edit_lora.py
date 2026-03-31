@@ -59,6 +59,68 @@ def get_lora_full_path(lora_name: str) -> str:
     return None
 
 
+def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
+                          log_prefix: str = "[LoRA]") -> None:
+    """Load LoRA with automatic key normalization for diffusers compatibility.
+
+    Some LoRAs (trained with certain frameworks) have state-dict keys that
+    include a ``transformer.`` component prefix baked into the key path, e.g.
+    ``transformer.transformer_blocks.0.attn.to_q.lora_A.weight``.  Diffusers'
+    ``QwenImageLoraLoaderMixin.load_lora_into_transformer`` passes the
+    state dict directly to PEFT without stripping this prefix, so PEFT
+    looks for a module called ``transformer.transformer_blocks.0.attn.to_q``
+    inside the transformer model — which doesn't exist (the transformer's
+    children start at ``transformer_blocks``, not ``transformer.transformer_blocks``).
+
+    The standard ComfyUI LoRA loader handles this via its own key mapping,
+    which is why the same LoRA loads fine there but fails here.
+
+    This helper tries the standard ``pipe.load_lora_weights()`` first (fast
+    path for well-formatted LoRAs).  On a "Target modules not found" error
+    it falls back to manual key normalization: stripping the ``transformer.``
+    prefix and loading directly into ``pipe.transformer.load_lora_adapter()``.
+    """
+    # ── Fast path: try standard loading ──────────────────────────────
+    try:
+        pipe.load_lora_weights(lora_path, adapter_name=adapter_name)
+        return
+    except ValueError as e:
+        if "Target modules" not in str(e) or "not found" not in str(e):
+            raise
+        print(f"{log_prefix} Standard load failed (key format mismatch), "
+              f"attempting key normalization...")
+
+    # ── Fallback: load state dict and normalize keys ────────────────
+    if lora_path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(lora_path)
+    else:
+        state_dict = torch.load(lora_path, map_location="cpu",
+                                weights_only=True)
+
+    # Strip the component prefix so keys are transformer-relative.
+    # e.g. "transformer.transformer_blocks.0.attn.to_q.lora_A.weight"
+    #   -> "transformer_blocks.0.attn.to_q.lora_A.weight"
+    prefix = "transformer."
+    cleaned = {}
+    for k, v in state_dict.items():
+        # Skip non-transformer keys (text encoder LoRA, etc.)
+        if k.startswith(("text_encoder.", "text_encoder_2.")):
+            continue
+        if k.startswith(prefix):
+            cleaned[k[len(prefix):]] = v
+        else:
+            cleaned[k] = v
+
+    # Load directly into the transformer, bypassing pipeline-level routing
+    pipe.transformer.load_lora_adapter(
+        cleaned,
+        network_alphas=None,
+        adapter_name=adapter_name,
+    )
+    print(f"{log_prefix} LoRA loaded successfully with key normalization")
+
+
 class EricQwenEditApplyLoRA:
     """
     Apply a LoRA to the Qwen-Edit pipeline.
@@ -158,11 +220,9 @@ class EricQwenEditApplyLoRA:
                 pipe.set_adapters([adapter_name], adapter_weights=[weight])
                 print(f"[EricQwenEdit] LoRA already loaded, updated weight: {adapter_name} -> {weight}")
             else:
-                # Load fresh
-                pipe.load_lora_weights(
-                    lora_path,
-                    adapter_name=adapter_name,
-                )
+                # Load fresh (with automatic key normalization fallback)
+                load_lora_with_key_fix(pipe, lora_path, adapter_name,
+                                      log_prefix="[EricQwenEdit]")
                 pipe.set_adapters([adapter_name], adapter_weights=[weight])
                 print(f"[EricQwenEdit] LoRA applied successfully: {adapter_name}")
             

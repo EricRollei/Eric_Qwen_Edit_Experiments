@@ -19,7 +19,7 @@ import os
 from typing import Tuple
 
 # Re-use the same helpers from the edit LoRA node (they are model-agnostic)
-from .eric_qwen_edit_lora import get_lora_list, get_lora_full_path
+from .eric_qwen_edit_lora import get_lora_list, get_lora_full_path, load_lora_with_key_fix
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -153,11 +153,9 @@ class EricQwenImageApplyLoRA:
                 pipe.set_adapters([adapter_name], adapter_weights=[effective_weight])
                 print(f"[EricQwenImage] LoRA already loaded, updated weight: {adapter_name} -> {effective_weight}")
             else:
-                # Load fresh
-                pipe.load_lora_weights(
-                    lora_path,
-                    adapter_name=adapter_name,
-                )
+                # Load fresh (with automatic key normalization fallback)
+                load_lora_with_key_fix(pipe, lora_path, adapter_name,
+                                      log_prefix="[EricQwenImage]")
                 pipe.set_adapters([adapter_name], adapter_weights=[effective_weight])
                 print(f"[EricQwenImage] LoRA applied successfully: {adapter_name}")
 
