@@ -73,24 +73,110 @@ def _load_state_dict(path: str) -> dict:
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
-def _normalize_keys(state_dict: dict) -> dict:
-    """Strip the ``transformer.`` component prefix from keys.
+def _adapter_module_path(key: str) -> str:
+    """Extract the module path from an adapter state-dict key.
 
-    Many non-diffusers LoRA files bake in the component prefix, e.g.
-    ``transformer.transformer_blocks.0.attn.to_q.lora_A.weight``.
-    Diffusers expects keys relative to the transformer module itself.
+    Strips adapter-specific suffixes like ``.lokr_w1``, ``.lora_A.weight``,
+    ``.alpha``, etc. so we get the bare module path that should correspond
+    to a ``nn.Module`` inside the transformer.
     """
-    prefix = "transformer."
-    cleaned = {}
+    _SUFFIXES = (
+        ".lokr_w1", ".lokr_w2", ".lokr_t2",
+        ".lora_A.weight", ".lora_A.default.weight",
+        ".lora_B.weight", ".lora_B.default.weight",
+        ".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b",
+        ".alpha", ".diff", ".diff_b",
+    )
+    for sfx in _SUFFIXES:
+        idx = key.find(sfx)
+        if idx >= 0:
+            return key[:idx]
+    # Fallback: strip last dotted component
+    return key.rsplit(".", 1)[0] if "." in key else key
+
+
+def _normalize_keys(state_dict: dict, model=None) -> dict:
+    """Strip component prefixes from state-dict keys.
+
+    Many non-diffusers LoRA files bake in a component prefix such as
+    ``transformer.``, ``diffusion_model.``, or ``model.diffusion_model.``.
+    Diffusers expects keys relative to the transformer module itself.
+
+    If *model* is provided (the ``nn.Module`` the adapter will target),
+    the function **auto-detects** which prefix to strip by comparing the
+    adapter module paths from the state dict against the model's
+    ``named_modules()``.  This makes it robust regardless of training
+    tool or checkpoint convention.
+    """
+    # Filter out text-encoder keys first
+    filtered = {}
     for k, v in state_dict.items():
-        # Skip non-transformer keys (text encoder LoRA, etc.)
         if k.startswith(("text_encoder.", "text_encoder_2.")):
             continue
-        if k.startswith(prefix):
-            cleaned[k[len(prefix):]] = v
-        else:
-            cleaned[k] = v
-    return cleaned
+        filtered[k] = v
+
+    if not filtered:
+        return filtered
+
+    # ── Smart mode: match against actual model modules ───────────────
+    if model is not None:
+        model_names = {name for name, _ in model.named_modules() if name}
+        sd_module_paths = {_adapter_module_path(k) for k in filtered}
+
+        # Already matches — no stripping needed
+        if sd_module_paths & model_names:
+            return filtered
+
+        # Try known prefixes (most common first)
+        _KNOWN = [
+            "transformer.",
+            "diffusion_model.",
+            "model.diffusion_model.",
+            "model.",
+        ]
+        for pfx in _KNOWN:
+            stripped = {p[len(pfx):] for p in sd_module_paths
+                        if p.startswith(pfx)}
+            if stripped & model_names:
+                cleaned = {}
+                for k, v in filtered.items():
+                    cleaned[k[len(pfx):] if k.startswith(pfx) else k] = v
+                return cleaned
+
+        # Auto-detect: find ANY prefix that produces matches
+        for sd_path in list(sd_module_paths)[:20]:
+            for m_path in list(model_names)[:50]:
+                if sd_path.endswith(m_path) and len(sd_path) > len(m_path):
+                    pfx = sd_path[: -len(m_path)]
+                    hit = sum(1 for p in sd_module_paths
+                              if p.startswith(pfx)
+                              and p[len(pfx):] in model_names)
+                    if hit > len(sd_module_paths) * 0.3:
+                        print(f"[LoRA] Auto-detected key prefix: '{pfx}'")
+                        cleaned = {}
+                        for k, v in filtered.items():
+                            cleaned[k[len(pfx):]
+                                    if k.startswith(pfx)
+                                    else k] = v
+                        return cleaned
+
+        # Nothing matched — warn and return as-is
+        print("[LoRA] WARNING: Could not match state-dict keys to model "
+              "modules after trying known prefixes.")
+        print(f"[LoRA]   state-dict paths (sample): "
+              f"{sorted(sd_module_paths)[:3]}")
+        print(f"[LoRA]   model module paths (sample): "
+              f"{sorted(model_names)[:5]}")
+        return filtered
+
+    # ── Simple mode (no model): strip 'transformer.' if present ──────
+    prefix = "transformer."
+    if any(k.startswith(prefix) for k in filtered):
+        cleaned = {}
+        for k, v in filtered.items():
+            cleaned[k[len(prefix):] if k.startswith(prefix) else k] = v
+        return cleaned
+    return filtered
 
 
 def _detect_adapter_type(state_dict: dict) -> str:
@@ -120,11 +206,26 @@ def _load_lokr_adapter(pipe, state_dict: dict, adapter_name: str,
     For LoKR we bypass the pipeline and use PEFT's ``inject_adapter_in_model``
     + ``set_peft_model_state_dict`` directly on the transformer.
 
+    If PEFT injection fails (e.g. due to unresolvable key mismatch), falls
+    back to **direct weight merging**: computes ``kron(w1, w2) * scale`` and
+    adds the deltas straight to the transformer parameters.
+
     Scaling convention: for full (non-decomposed) LoKR the effective delta is
     ``kron(w1, w2) * (alpha / r)``.  We set ``alpha = r`` in the config so
     that the base scaling is 1.0 (matching ComfyUI / LyCORIS convention).
     ``set_adapters()`` then multiplies by the user-supplied weight.
     """
+    try:
+        _load_lokr_adapter_peft(pipe, state_dict, adapter_name, log_prefix)
+    except (ValueError, RuntimeError) as peft_err:
+        print(f"{log_prefix} PEFT injection failed: {peft_err}")
+        print(f"{log_prefix} Falling back to direct weight merge...")
+        _load_lokr_adapter_direct(pipe, state_dict, adapter_name, log_prefix)
+
+
+def _load_lokr_adapter_peft(pipe, state_dict: dict, adapter_name: str,
+                            log_prefix: str = "[LoRA]") -> None:
+    """Inject LoKR adapter via PEFT's ``inject_adapter_in_model``."""
     from peft import LoKrConfig, inject_adapter_in_model, set_peft_model_state_dict
 
     transformer = pipe.transformer
@@ -168,13 +269,121 @@ def _load_lokr_adapter(pipe, state_dict: dict, adapter_name: str,
     print(f"{log_prefix} LoKR adapter loaded successfully via PEFT injection")
 
 
+def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
+                              log_prefix: str = "[LoRA]") -> None:
+    """Apply LoKR adapter by directly merging weights into the transformer.
+
+    Computes ``kron(w1, w2) * (alpha / r)`` (or ``kron(w1, w2)`` when
+    alpha equals r) and adds the delta to each target parameter.
+
+    This is the same approach ComfyUI's native weight patcher uses.
+    The adapter is registered in ``peft_config`` so ``set_adapters()``
+    can still find it, but per-stage weight adjustment is limited to a
+    single re-merge at changed weight.
+    """
+    import math, re
+
+    transformer = pipe.transformer
+    model_sd = dict(transformer.named_parameters())
+
+    # Group state dict keys by module path
+    modules: dict[str, dict] = {}  # module_path -> {"lokr_w1": ..., ...}
+    for k, v in state_dict.items():
+        path = _adapter_module_path(k)
+        # Extract the param name (e.g., "lokr_w1", "alpha")
+        param_name = k[len(path) + 1:]  # +1 for the dot
+        modules.setdefault(path, {})[param_name] = v
+
+    applied = 0
+    skipped = 0
+    for mod_path, params in modules.items():
+        w1 = params.get("lokr_w1")
+        w2 = params.get("lokr_w2")
+        if w1 is None or w2 is None:
+            skipped += 1
+            continue
+
+        # Compute scaling factor
+        alpha = params.get("alpha")
+        alpha_val = alpha.item() if alpha is not None else 1.0
+        # For full LoKR, r is inferred from the matrix dimensions.
+        # ComfyUI convention: the rank dim is the smaller of w1/w2.
+        # If alpha == r, scale = 1.0.
+        r_val = min(w1.shape) if w1.ndim >= 2 else 1
+        scale = alpha_val / r_val if r_val > 0 else 1.0
+
+        # Compute delta = kron(w1, w2) * scale
+        w1f = w1.float()
+        w2f = w2.float()
+        delta = torch.kron(w1f, w2f) * scale
+
+        # Match to model param.  LoKR targets ".weight" by default.
+        target_key = mod_path + ".weight"
+        if target_key not in model_sd:
+            # Try without .weight suffix
+            target_key = mod_path
+        if target_key not in model_sd:
+            skipped += 1
+            continue
+
+        param = model_sd[target_key]
+        if delta.shape != param.shape:
+            # Try reshaping
+            try:
+                delta = delta.reshape(param.shape)
+            except RuntimeError:
+                print(f"{log_prefix} Shape mismatch for {mod_path}: "
+                      f"delta {delta.shape} vs param {param.shape}, skipping")
+                skipped += 1
+                continue
+
+        # Store original weights for potential unloading
+        backup_key = f"_lokr_backup_{adapter_name}"
+        if not hasattr(transformer, backup_key):
+            setattr(transformer, backup_key, {})
+        backup = getattr(transformer, backup_key)
+        if target_key not in backup:
+            backup[target_key] = param.data.clone()
+
+        # Apply delta
+        param.data.add_(delta.to(dtype=param.dtype, device=param.device))
+        applied += 1
+
+    # Register in peft_config for set_adapters() discovery
+    if not hasattr(transformer, "peft_config"):
+        transformer.peft_config = {}
+    # Minimal config marker so get_list_adapters() finds this adapter
+    transformer.peft_config[adapter_name] = {
+        "_type": "lokr_direct",
+        "_applied_modules": applied,
+    }
+    if not getattr(transformer, "_hf_peft_config_loaded", False):
+        transformer._hf_peft_config_loaded = True
+
+    print(f"{log_prefix} LoKR direct merge: applied={applied}, "
+          f"skipped={skipped}")
+
+
 def _load_loha_adapter(pipe, state_dict: dict, adapter_name: str,
                        log_prefix: str = "[LoRA]") -> None:
     """Inject a LoHa (Hadamard) adapter via PEFT.
 
     LoHa always uses decomposed weights (w1_a/w1_b, w2_a/w2_b), so the
     rank ``r`` is directly available from the weight shapes.
+
+    Falls back to direct weight merge if PEFT injection fails.
     """
+    try:
+        _load_loha_adapter_peft(pipe, state_dict, adapter_name, log_prefix)
+    except (ValueError, RuntimeError) as peft_err:
+        print(f"{log_prefix} PEFT injection failed for LoHa: {peft_err}")
+        print(f"{log_prefix} Falling back to direct weight merge...")
+        _load_loha_adapter_direct(pipe, state_dict, adapter_name, log_prefix)
+
+
+def _load_loha_adapter_peft(pipe, state_dict: dict, adapter_name: str,
+                            log_prefix: str = "[LoRA]") -> None:
+    """Inject LoHa adapter via PEFT's ``inject_adapter_in_model``."""
     from peft import LoHaConfig, inject_adapter_in_model, set_peft_model_state_dict
 
     transformer = pipe.transformer
@@ -224,6 +433,84 @@ def _load_loha_adapter(pipe, state_dict: dict, adapter_name: str,
     print(f"{log_prefix} LoHa adapter loaded successfully via PEFT injection")
 
 
+def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
+                              log_prefix: str = "[LoRA]") -> None:
+    """Apply LoHa adapter by directly merging weights into the transformer.
+
+    LoHa delta = ``(w1_a @ w1_b) * (w2_a @ w2_b) * (alpha / r)``.
+    """
+    transformer = pipe.transformer
+    model_sd = dict(transformer.named_parameters())
+
+    # Group state dict keys by module path
+    modules: dict[str, dict] = {}
+    for k, v in state_dict.items():
+        path = _adapter_module_path(k)
+        param_name = k[len(path) + 1:]
+        modules.setdefault(path, {})[param_name] = v
+
+    applied = 0
+    skipped = 0
+    for mod_path, params in modules.items():
+        w1_a = params.get("hada_w1_a")
+        w1_b = params.get("hada_w1_b")
+        w2_a = params.get("hada_w2_a")
+        w2_b = params.get("hada_w2_b")
+        if w1_a is None or w1_b is None or w2_a is None or w2_b is None:
+            skipped += 1
+            continue
+
+        # Scaling
+        alpha = params.get("alpha")
+        alpha_val = alpha.item() if alpha is not None else 1.0
+        r_val = w1_b.shape[0] if w1_b.ndim >= 2 else 1
+        scale = alpha_val / r_val if r_val > 0 else 1.0
+
+        # delta = (w1_a @ w1_b) * (w2_a @ w2_b) * scale
+        w1 = (w1_a.float() @ w1_b.float())
+        w2 = (w2_a.float() @ w2_b.float())
+        delta = w1 * w2 * scale
+
+        target_key = mod_path + ".weight"
+        if target_key not in model_sd:
+            target_key = mod_path
+        if target_key not in model_sd:
+            skipped += 1
+            continue
+
+        param = model_sd[target_key]
+        if delta.shape != param.shape:
+            try:
+                delta = delta.reshape(param.shape)
+            except RuntimeError:
+                print(f"{log_prefix} LoHa shape mismatch for {mod_path}: "
+                      f"delta {delta.shape} vs param {param.shape}, skipping")
+                skipped += 1
+                continue
+
+        backup_key = f"_loha_backup_{adapter_name}"
+        if not hasattr(transformer, backup_key):
+            setattr(transformer, backup_key, {})
+        backup = getattr(transformer, backup_key)
+        if target_key not in backup:
+            backup[target_key] = param.data.clone()
+
+        param.data.add_(delta.to(dtype=param.dtype, device=param.device))
+        applied += 1
+
+    if not hasattr(transformer, "peft_config"):
+        transformer.peft_config = {}
+    transformer.peft_config[adapter_name] = {
+        "_type": "loha_direct",
+        "_applied_modules": applied,
+    }
+    if not getattr(transformer, "_hf_peft_config_loaded", False):
+        transformer._hf_peft_config_loaded = True
+
+    print(f"{log_prefix} LoHa direct merge: applied={applied}, "
+          f"skipped={skipped}")
+
+
 def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
                           log_prefix: str = "[LoRA]") -> None:
     """Load a LoRA / LoKR / LoHa adapter with automatic format detection.
@@ -263,7 +550,8 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
 
     # ── Fallback: manual load + format detection ─────────────────────
     state_dict = _load_state_dict(lora_path)
-    state_dict = _normalize_keys(state_dict)
+    transformer = getattr(pipe, "transformer", None)
+    state_dict = _normalize_keys(state_dict, model=transformer)
 
     adapter_type = _detect_adapter_type(state_dict)
     print(f"{log_prefix} Detected adapter format: {adapter_type}")
