@@ -867,6 +867,12 @@ Text-to-image generation guided by ControlNet (Canny, SoftEdge, Depth, or Pose) 
 
 ![Qwen-Image Hi-Res ControlNet workflow](workflows/Qwen-Image-HiRes-Controlnet.png)
 
+### Qwen-Image UltraGen Hi-Res (30 MP+)
+
+Text-to-image generation without ControlNet using the UltraGen multi-stage pipeline. Produces 30 MP+ output with Spectrum acceleration and upscale VAE.
+
+![Qwen-Image UltraGen Hi-Res 30MP+ workflow](workflows/Qwen-image-UltraGen-HiRes-30mp-plus.png)
+
 See the `examples/` and `workflows/` folders for additional workflow files and screenshots.
 
 ## Example Prompts
