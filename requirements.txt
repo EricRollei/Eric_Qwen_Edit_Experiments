@@ -1,6 +1,9 @@
 torch>=2.0.0
-diffusers>=0.30.0
-transformers>=4.40.0
+# transformers 5.x removed HybridCache, which diffusers <=0.37.x still imports
+# via diffusers.loaders.peft (used by AutoencoderKLWan, QwenImageLoraLoaderMixin, etc.)
+# Stay on 4.x until a diffusers release ships the fix.
+transformers>=4.50,<5
+diffusers>=0.34,<0.38
 accelerate
 safetensors
 pillow

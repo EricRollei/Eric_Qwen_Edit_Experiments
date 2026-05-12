@@ -15,6 +15,7 @@ Author: Eric Hiss (GitHub: EricRollei)
 """
 
 import os
+import re
 import folder_paths
 import torch
 from typing import Tuple, List
@@ -842,6 +843,120 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
         )
 
 
+def _diagnose_lora_compatibility(lora_path: str, transformer) -> str:
+    """Analyze LoRA compatibility against a transformer without applying it.
+
+    Returns a multi-line diagnostic report string.
+    """
+    lines = []
+    filename = os.path.basename(lora_path)
+    sep = "=" * 60
+    lines.append(sep)
+    lines.append(f"LoRA Diagnostic: {filename}")
+    lines.append(sep)
+
+    # ── Load raw state dict ───────────────────────────────────────────
+    try:
+        sd = _load_state_dict(lora_path)
+    except Exception as exc:
+        return f"{sep}\nLoRA Diagnostic: {filename}\n{sep}\nERROR: Could not load file — {exc}\n{sep}"
+
+    total_keys = len(sd)
+    lines.append(f"Total tensor keys: {total_keys}")
+
+    # Text-encoder keys (we don't apply these to the transformer)
+    te_keys = [k for k in sd if k.startswith(("text_encoder.", "text_encoder_2."))]
+    if te_keys:
+        lines.append(f"Text encoder keys (not applied): {len(te_keys)}")
+
+    # ── Adapter type detection ────────────────────────────────────────
+    adapter_type = _detect_adapter_type(sd)
+    lines.append(f"Adapter type: {adapter_type.upper()}")
+
+    # ── Rank / alpha (LoRA only) ──────────────────────────────────────
+    if adapter_type == "lora":
+        sd_r = _rename_lora_down_up(sd)
+        ranks, alphas = [], []
+        for k, v in sd_r.items():
+            if "lora_A" in k and v.ndim >= 2:
+                ranks.append(v.shape[0])
+            if k.endswith(".alpha") and v.numel() == 1:
+                alphas.append(round(v.item(), 3))
+        if ranks:
+            unique_ranks = sorted(set(ranks))
+            lines.append(f"Rank(s): {unique_ranks}")
+            avg_rank = sum(ranks) / len(ranks)
+            if avg_rank > 128:
+                lines.append(f"  NOTE: High rank ({avg_rank:.0f}) — may cause instability")
+        if alphas:
+            unique_alphas = sorted(set(alphas))
+            lines.append(f"Alpha(s): {unique_alphas}")
+            if ranks:
+                ratio = (sum(alphas) / len(alphas)) / (sum(ranks) / len(ranks))
+                lines.append(f"  alpha/rank ratio: {ratio:.3f}  (1.0 = neutral)")
+        if not ranks:
+            lines.append("  WARNING: No lora_A tensors found — file may be malformed")
+    elif adapter_type == "lokr":
+        lines.append("Format: LoKR (Kronecker decomposition)")
+    elif adapter_type == "loha":
+        lines.append("Format: LoHa (Hadamard product)")
+        for k, v in sd.items():
+            if ".hada_w1_b" in k and v.ndim >= 2:
+                lines.append(f"  Rank (from w1_b): {v.shape[0]}")
+                break
+    else:
+        lines.append("WARNING: Unrecognised format — corrupt file or unsupported training tool.")
+        lines.append(f"  First 5 raw keys: {list(sd.keys())[:5]}")
+
+    # ── Key-prefix detection (before normalisation) ───────────────────
+    raw_paths = {_adapter_module_path(k) for k in sd
+                 if not k.startswith(("text_encoder.", "text_encoder_2."))}
+    found_prefixes = [p for p in
+                      ("transformer.", "diffusion_model.", "model.diffusion_model.", "model.", "unet.")
+                      if any(rp.startswith(p) for rp in raw_paths)]
+    if found_prefixes:
+        lines.append(f"Key prefix(es) auto-stripped: {found_prefixes}")
+
+    # ── Normalise keys and match against model ────────────────────────
+    sd_norm = _normalize_keys(sd, model=transformer)
+    sd_module_paths = {_adapter_module_path(k) for k in sd_norm}
+    model_module_names = {name for name, _ in transformer.named_modules() if name}
+
+    matched = sd_module_paths & model_module_names
+    unmatched = sd_module_paths - model_module_names
+    n_total = len(sd_module_paths)
+    n_matched = len(matched)
+    match_pct = n_matched / n_total * 100 if n_total > 0 else 0.0
+
+    lines.append("")
+    lines.append(f"Adapter modules: {n_total}")
+    lines.append(f"Matched modules:  {n_matched} ({match_pct:.0f}%)")
+
+    # ── Verdict ───────────────────────────────────────────────────────
+    lines.append("")
+    if match_pct >= 75:
+        lines.append("VERDICT: COMPATIBLE")
+        lines.append("Most adapter modules match the transformer architecture.")
+        if n_total > n_matched:
+            lines.append(f"  {n_total - n_matched} unmatched module(s) will be skipped.")
+    elif match_pct >= 30:
+        lines.append("VERDICT: PARTIAL MATCH  \u26a0")
+        lines.append(f"Only {match_pct:.0f}% of modules matched.  May produce partial effects or artifacts.")
+        lines.append("If output looks like noise, this LoRA targets a different architecture variant.")
+        if unmatched:
+            lines.append(f"  Unmatched sample: {sorted(unmatched)[:5]}")
+    else:
+        lines.append("VERDICT: INCOMPATIBLE  \u2717")
+        lines.append(f"Only {match_pct:.0f}% of modules matched — this LoRA was almost certainly")
+        lines.append("trained for a DIFFERENT architecture (e.g. SDXL, SD1.5, Flux).")
+        lines.append("Applying it will likely produce corrupted output (pure noise / artifacts).")
+        lines.append(f"  Sample LoRA modules:  {sorted(sd_module_paths)[:5]}")
+        lines.append(f"  Sample model modules: {sorted(model_module_names)[:5]}")
+
+    lines.append(sep)
+    return "\n".join(lines)
+
+
 class EricQwenEditApplyLoRA:
     """
     Apply a LoRA to the Qwen-Edit pipeline.
@@ -888,6 +1003,17 @@ class EricQwenEditApplyLoRA:
                     "default": "",
                     "tooltip": "Optional: Override with custom path (leave empty to use dropdown)"
                 }),
+                "keep_loaded": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "Keep the LoRA adapter loaded between runs.\n"
+                        "\u2022 True (default): load once, reuse on subsequent runs\n"
+                        "  (faster; useful for final render settings).\n"
+                        "\u2022 False: unload ALL adapters before loading this LoRA\n"
+                        "  on every run. Ensures a clean state each generation;\n"
+                        "  useful when testing or swapping LoRAs frequently."
+                    )
+                }),
             }
         }
     
@@ -902,6 +1028,7 @@ class EricQwenEditApplyLoRA:
         lora_name: str,
         weight: float = 1.0,
         lora_path_override: str = "",
+        keep_loaded: bool = True,
     ) -> Tuple[dict]:
         """Apply LoRA to the pipeline."""
         pipe = pipeline["pipeline"]
@@ -921,10 +1048,21 @@ class EricQwenEditApplyLoRA:
         
         lora_filename = os.path.basename(lora_path)
         adapter_name = os.path.splitext(lora_filename)[0]  # Remove extension for adapter name
+        # PEFT/PyTorch ModuleDict keys cannot contain '.', so sanitize.
+        adapter_name = re.sub(r"[.\s]", "_", adapter_name)
         
         print(f"[EricQwenEdit] Applying LoRA: {lora_filename}")
         print(f"[EricQwenEdit] Path: {lora_path}")
-        print(f"[EricQwenEdit] Weight: {weight}")
+        print(f"[EricQwenEdit] Weight: {weight}, keep_loaded: {keep_loaded}")
+        
+        # If keep_loaded=False, unload everything first for a clean state each run
+        if not keep_loaded:
+            try:
+                pipe.unload_lora_weights()
+                pipeline.pop("applied_loras", None)
+                print("[EricQwenEdit] Unloaded previous LoRAs (keep_loaded=False)")
+            except Exception:
+                pass
         
         # Check if this adapter is already loaded
         loaded_adapters = set()
@@ -1001,3 +1139,72 @@ class EricQwenEditUnloadLoRA:
             print(f"[EricQwenEdit] Note: {e}")
         
         return (pipeline,)
+
+
+class EricQwenEditDiagnoseLoRA:
+    """
+    Diagnose LoRA compatibility with the Qwen-Edit pipeline.
+
+    Loads the LoRA file and inspects its keys WITHOUT applying it,
+    then prints a compatibility report to the console and returns it
+    as a STRING.  Useful for understanding why a LoRA produces noise
+    or fails to load.
+
+    The report includes:
+    - Adapter type (LoRA / LoKR / LoHa / unknown)
+    - Rank and alpha values (for standard LoRA)
+    - How many adapter modules match the transformer architecture
+    - A COMPATIBLE / PARTIAL / INCOMPATIBLE verdict
+    """
+
+    CATEGORY = "Eric Qwen-Edit"
+    FUNCTION = "diagnose"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("report",)
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipeline": ("QWEN_EDIT_PIPELINE",),
+                "lora_name": (get_lora_list(), {
+                    "tooltip": "LoRA to analyze (inspected but NOT applied)"
+                }),
+            },
+            "optional": {
+                "lora_path_override": ("STRING", {
+                    "default": "",
+                    "tooltip": "Override with full path instead of dropdown"
+                }),
+            }
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def diagnose(
+        self,
+        pipeline: dict,
+        lora_name: str,
+        lora_path_override: str = "",
+    ) -> Tuple:
+        pipe = pipeline["pipeline"]
+        transformer = pipe.transformer
+
+        if lora_path_override and lora_path_override.strip():
+            lora_path = lora_path_override.strip()
+        else:
+            if lora_name == "none" or not lora_name:
+                return ("No LoRA selected.",)
+            lora_path = get_lora_full_path(lora_name)
+            if lora_path is None:
+                return (f"ERROR: LoRA file not found: {lora_name}",)
+
+        if not os.path.exists(lora_path):
+            return (f"ERROR: File not found: {lora_path}",)
+
+        report = _diagnose_lora_compatibility(lora_path, transformer)
+        print(report)
+        return (report,)

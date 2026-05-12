@@ -24,7 +24,7 @@ Author: Eric Hiss (GitHub: EricRollei)
 import math
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 from typing import Tuple
 
 from .eric_qwen_edit_utils import pil_to_tensor
@@ -76,12 +76,18 @@ CN_FIT_MODES = [
     "pad_black_left",
     "pad_black_right",
     "pad_black_top",
+    "pad_black_bottom",
+    "pad_edge_left",
+    "pad_edge_right",
+    "pad_edge_top",
+    "pad_edge_bottom",
     "stretch",
 ]
 
 
 def _fit_control_image(
-    pil_img: Image.Image, target_w: int, target_h: int, mode: str
+    pil_img: Image.Image, target_w: int, target_h: int, mode: str,
+    pad_edge_blur: float = 0.4,
 ) -> Image.Image:
     """Resize a control image to *exactly* (target_w, target_h) using
     the chosen fit strategy.  All crop/pad variants preserve aspect
@@ -118,34 +124,121 @@ def _fit_control_image(
 
         return scaled.crop((left, top, left + target_w, top + target_h))
 
+    # ── Scale-to-fit (for all pad modes) ────────────────────────────
+    scale = min(target_w / src_w, target_h / src_h)
+    new_w = int(round(src_w * scale))
+    new_h = int(round(src_h * scale))
+    scaled = pil_img.resize((new_w, new_h), Image.LANCZOS)
+
+    # Resolve image position within canvas
+    pad_side = (mode.replace("pad_black_", "").replace("pad_edge_", ""))
+    if pad_side == "left":
+        x = target_w - new_w
+        y = (target_h - new_h) // 2
+    elif pad_side == "right":
+        x = 0
+        y = (target_h - new_h) // 2
+    elif pad_side == "top":
+        x = (target_w - new_w) // 2
+        y = target_h - new_h
+    elif pad_side == "bottom":
+        x = (target_w - new_w) // 2
+        y = 0
+    else:
+        x = (target_w - new_w) // 2
+        y = (target_h - new_h) // 2
+
     if mode.startswith("pad_black_"):
-        # Scale so the image *fits inside* the target (scale by smaller ratio)
-        scale = min(target_w / src_w, target_h / src_h)
-        new_w = int(round(src_w * scale))
-        new_h = int(round(src_h * scale))
-        scaled = pil_img.resize((new_w, new_h), Image.LANCZOS)
-
         canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
-        pad_side = mode.replace("pad_black_", "")
-
-        if pad_side == "left":
-            x = target_w - new_w
-            y = (target_h - new_h) // 2
-        elif pad_side == "right":
-            x = 0
-            y = (target_h - new_h) // 2
-        elif pad_side == "top":
-            x = (target_w - new_w) // 2
-            y = target_h - new_h
-        else:
-            x = (target_w - new_w) // 2
-            y = (target_h - new_h) // 2
-
         canvas.paste(scaled, (x, y))
         return canvas
 
+    if mode.startswith("pad_edge_"):
+        return _edge_extend_fill(scaled, target_w, target_h, x, y, pad_edge_blur)
+
     # Fallback — simple resize
     return pil_img.resize((target_w, target_h), Image.LANCZOS)
+
+
+def _edge_extend_fill(
+    pil_img: Image.Image,
+    canvas_w: int,
+    canvas_h: int,
+    img_x: int,
+    img_y: int,
+    blur_strength: float = 0.4,
+) -> Image.Image:
+    """Place pil_img on a canvas of (canvas_w, canvas_h) at (img_x, img_y)
+    and fill the surrounding padding by replicating edge pixels outward.
+    A Gaussian blur is then composited over the padding zone to produce a
+    smooth, natural-looking depth taper instead of a hard colour boundary.
+
+    The original image area is preserved exactly; only the pad region is
+    blurred.  blur_strength 0.0 = pure replication, 1.0 = heavy blur.
+    """
+    img_w, img_h = pil_img.size
+    right_end  = img_x + img_w
+    bottom_end = img_y + img_h
+
+    arr = np.array(pil_img, dtype=np.float32)  # (img_h, img_w, 3)
+    canvas = np.empty((canvas_h, canvas_w, 3), dtype=np.float32)
+
+    # ── Place original image ─────────────────────────────────────────
+    canvas[img_y:bottom_end, img_x:right_end] = arr
+
+    # ── Replicate edges outward ──────────────────────────────────────
+    if img_x > 0:                     # left pad
+        canvas[img_y:bottom_end, :img_x] = arr[:, 0:1]
+    if right_end < canvas_w:          # right pad
+        canvas[img_y:bottom_end, right_end:] = arr[:, -1:]
+    if img_y > 0:                     # top pad
+        canvas[:img_y, img_x:right_end] = arr[0:1, :]
+    if bottom_end < canvas_h:         # bottom pad
+        canvas[bottom_end:, img_x:right_end] = arr[-1:, :]
+
+    # ── Corners (fill from nearest corner pixel) ─────────────────────
+    if img_y > 0 and img_x > 0:
+        canvas[:img_y,      :img_x]      = arr[0, 0]
+    if img_y > 0 and right_end < canvas_w:
+        canvas[:img_y,      right_end:]  = arr[0, -1]
+    if bottom_end < canvas_h and img_x > 0:
+        canvas[bottom_end:, :img_x]      = arr[-1, 0]
+    if bottom_end < canvas_h and right_end < canvas_w:
+        canvas[bottom_end:, right_end:]  = arr[-1, -1]
+
+    if blur_strength <= 0.0:
+        return Image.fromarray(canvas.clip(0, 255).astype(np.uint8))
+
+    # ── Gaussian feather over the pad zone ───────────────────────────
+    # Blur radius is proportional to the largest pad dimension
+    pad_left   = img_x
+    pad_right  = canvas_w - right_end
+    pad_top    = img_y
+    pad_bottom = canvas_h - bottom_end
+    max_pad    = max(pad_left, pad_right, pad_top, pad_bottom, 1)
+    blur_r     = max(int(round(max_pad * blur_strength * 0.5)), 2)
+
+    canvas_pil  = Image.fromarray(canvas.clip(0, 255).astype(np.uint8))
+    blurred_arr = np.array(
+        canvas_pil.filter(ImageFilter.GaussianBlur(radius=blur_r)),
+        dtype=np.float32,
+    )
+
+    # Mask: 0 = original image area (keep sharp), 1 = padding (use blurred)
+    # Feather the seam by blurring the mask itself
+    mask_arr = np.ones((canvas_h, canvas_w), dtype=np.float32)
+    mask_arr[img_y:bottom_end, img_x:right_end] = 0.0
+    feather_r = max(blur_r // 3, 2)
+    soft_mask = np.array(
+        Image.fromarray((mask_arr * 255).astype(np.uint8), mode="L").filter(
+            ImageFilter.GaussianBlur(radius=feather_r)
+        ),
+        dtype=np.float32,
+    ) / 255.0
+    soft_mask = soft_mask[:, :, None]  # broadcast over channels
+
+    result = canvas * (1.0 - soft_mask) + blurred_arr * soft_mask
+    return Image.fromarray(result.clip(0, 255).astype(np.uint8))
 
 
 def _closest_aspect_ratio(
@@ -220,7 +313,9 @@ class EricQwenImageUltraGenCN:
                         "\u2022 crop_center \u2014 scale to cover, center crop\n"
                         "\u2022 crop_top_left/right \u2014 crop from corner\n"
                         "\u2022 crop_bottom_left/right \u2014 crop from corner\n"
-                        "\u2022 pad_black_left/right/top \u2014 fit inside, pad with black\n"
+                        "\u2022 pad_black_left/right/top/bottom \u2014 fit inside, pad with black\n"
+                        "\u2022 pad_edge_left/right/top/bottom \u2014 fit inside, extend edges\n"
+                        "  with Gaussian feathering (ideal for depth maps)\n"
                         "\u2022 stretch \u2014 distort to fill (legacy)"
                     )
                 }),
@@ -487,6 +582,21 @@ class EricQwenImageUltraGenCN:
                         "• both — inter-stage + final decode"
                     )
                 }),
+                "pad_edge_blur": ("FLOAT", {
+                    "default": 0.4,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": (
+                        "Blur strength for pad_edge_* fit modes.\n"
+                        "Controls how far the Gaussian feather extends into\n"
+                        "the padding zone.\n"
+                        "\u2022 0.0 = pure edge replication (may show bands at seam)\n"
+                        "\u2022 0.4 = default \u2014 gentle, natural depth taper\n"
+                        "\u2022 1.0 = heavy blur, very soft fade\n"
+                        "Has no effect on pad_black_* or other modes."
+                    )
+                }),
             }
         }
 
@@ -536,6 +646,7 @@ class EricQwenImageUltraGenCN:
         # Upscale VAE (optional)
         upscale_vae=None,
         upscale_vae_mode: str = "disabled",
+        pad_edge_blur: float = 0.4,
     ) -> Tuple[torch.Tensor]:
         pipe = pipeline["pipeline"]
         cn_model = controlnet["model"]
@@ -606,7 +717,7 @@ class EricQwenImageUltraGenCN:
 
         # ── Fit control image to S1 dimensions ────────────────────────
         control_pil_s1 = _fit_control_image(
-            control_pil, s1_w, s1_h, cn_fit_mode
+            control_pil, s1_w, s1_h, cn_fit_mode, pad_edge_blur
         )
         print(f"[UltraGenCN] Control image fitted to {s1_w}\u00d7{s1_h} "
               f"(S1, mode={cn_fit_mode})")
@@ -616,7 +727,7 @@ class EricQwenImageUltraGenCN:
         use_cn_s2 = do_stage2 and s2_cn_scale > 0.0
         if use_cn_s2:
             control_pil_s2 = _fit_control_image(
-                control_pil, s2_w, s2_h, cn_fit_mode
+                control_pil, s2_w, s2_h, cn_fit_mode, pad_edge_blur
             )
             print(f"[UltraGenCN] Control image fitted to {s2_w}\u00d7{s2_h} "
                   f"(S2, mode={cn_fit_mode})")

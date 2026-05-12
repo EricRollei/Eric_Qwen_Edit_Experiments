@@ -33,3 +33,6 @@ examples/not public/
 
 # Archives
 *.zip
+
+# Training outputs (large checkpoint files)
+training/output/silvermax_lora/

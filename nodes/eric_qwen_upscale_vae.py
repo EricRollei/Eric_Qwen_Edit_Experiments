@@ -25,6 +25,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from .eric_qwen_edit_utils import patch_cosine_blend_vae
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Loader Node
@@ -63,6 +65,14 @@ class EricQwenUpscaleVAELoader:
                     "default": "bfloat16",
                     "tooltip": "Model precision. bfloat16 recommended.",
                 }),
+                "vae_tile_blend": (["cosine", "linear"], {
+                    "default": "cosine",
+                    "tooltip": (
+                        "Tile-seam blending when tiling is active.\n"
+                        "• cosine — C¹-smooth; eliminates faint grid lines.\n"
+                        "• linear — original diffusers behaviour."
+                    ),
+                }),
             },
         }
 
@@ -73,7 +83,8 @@ class EricQwenUpscaleVAELoader:
 
     def load_vae(self, model_path: str,
                  subfolder: str = "diffusers/Wan2.1_VAE_upscale2x_imageonly_real_v1",
-                 dtype: str = "bfloat16"):
+                 dtype: str = "bfloat16",
+                 vae_tile_blend: str = "cosine"):
         from diffusers import AutoencoderKLWan
 
         dtype_map = {
@@ -92,6 +103,7 @@ class EricQwenUpscaleVAELoader:
         vae.eval()
         print(f"[EricQwen] Upscale VAE loaded (dtype={dt}). "
               f"Decoder out_channels={vae.config.out_channels}")
+        vae._vae_tile_blend = vae_tile_blend
         return (vae,)
 
 
@@ -146,7 +158,11 @@ def decode_latents_with_upscale_vae(
             tile_sample_stride_height=192,
             tile_sample_stride_width=192,
         )
-        print(f"[EricQwen] Tiled VAE decode enabled (latent {h_lat}×{w_lat})")
+        if getattr(upscale_vae, "_vae_tile_blend", "cosine") == "cosine":
+            patch_cosine_blend_vae(upscale_vae)
+            print(f"[EricQwen] Tiled VAE decode enabled with cosine blending (latent {h_lat}\u00d7{w_lat})")
+        else:
+            print(f"[EricQwen] Tiled VAE decode enabled with linear blending (latent {h_lat}\u00d7{w_lat})")
     else:
         upscale_vae.use_tiling = False
 
@@ -246,6 +262,8 @@ def upscale_between_stages(
 
     # ── Step 1: Decode with upscale VAE → 2× pixels ──────────────────
     upscale_vae = upscale_vae.to(device)
+    if getattr(upscale_vae, "_vae_tile_blend", "cosine") == "cosine":
+        patch_cosine_blend_vae(upscale_vae)  # no-op if already patched or tiling not active
     try:
         spatial = _unpack_latents(packed_latents, height, width,
                                   vae_scale_factor)

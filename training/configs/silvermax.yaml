@@ -1,0 +1,33 @@
+# Silvermax film emulation LoRA training config
+# Run: python train_style_lora.py --config configs/silvermax.yaml
+
+# Paths
+data_dir: C:\Users\Eric\Downloads\SilverMax-Direction-Training-set       # folder with color/bw image pairs
+output_dir: ./output/silvermax_lora
+base_model: H:\Testing\FireRed-Image-Edit-1.1     # or local path to downloaded model
+
+# Training prompts - what A→B and B→A mean
+forward_prompt: "convert to Silvermax film black and white, high contrast, rich shadow detail"
+backward_prompt: "colorize with natural realistic skin tones and colors"
+
+# LoRA settings
+lora_rank: 16          # 8-16 for style, 4-8 for expression
+lora_alpha: 16.0       # usually matches rank
+lora_dropout: 0.05
+
+# Hyperparameters
+steps: 2000
+batch_size: 1
+lr: 0.0001
+sym_weight: 0.1        # 0 to disable symmetry loss, 0.1-0.3 recommended
+gradient_accumulation_steps: 4
+save_every: 500
+seed: 42
+
+# Resolution - 512 is fast, 768 is better quality
+resolution: 768
+
+# Hardware
+device: cuda:1
+dtype: bfloat16        # bfloat16 for Blackwell/Ampere GPUs
+gradient_checkpointing: true

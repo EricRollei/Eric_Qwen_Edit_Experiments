@@ -16,12 +16,14 @@ Author: Eric Hiss (GitHub: EricRollei)
 """
 
 import os
+import re
 from typing import Tuple
 
 # Re-use the same helpers from the edit LoRA node (they are model-agnostic)
 from .eric_qwen_edit_lora import (get_lora_list, get_lora_full_path,
                                   load_lora_with_key_fix,
-                                  _set_adapters_safe)
+                                  _set_adapters_safe,
+                                  _diagnose_lora_compatibility)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -96,6 +98,17 @@ class EricQwenImageApplyLoRA:
                     "default": "",
                     "tooltip": "Optional: Override with custom path (leave empty to use dropdown)"
                 }),
+                "keep_loaded": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "Keep the LoRA adapter loaded between runs.\n"
+                        "\u2022 True (default): load once, reuse on subsequent runs\n"
+                        "  (faster; useful for final render settings).\n"
+                        "\u2022 False: unload ALL adapters before loading this LoRA\n"
+                        "  on every run. Ensures a clean state each generation;\n"
+                        "  useful when testing or swapping LoRAs frequently."
+                    )
+                }),
             }
         }
 
@@ -112,6 +125,7 @@ class EricQwenImageApplyLoRA:
         weight_stage2: float = 0.0,
         weight_stage3: float = 0.0,
         lora_path_override: str = "",
+        keep_loaded: bool = True,
     ) -> Tuple[dict]:
         """Apply LoRA to the Qwen-Image pipeline."""
         pipe = pipeline["pipeline"]
@@ -131,6 +145,10 @@ class EricQwenImageApplyLoRA:
 
         lora_filename = os.path.basename(lora_path)
         adapter_name = os.path.splitext(lora_filename)[0]
+        # PEFT/PyTorch ModuleDict keys cannot contain '.', so sanitize the
+        # adapter name (filenames like 'Qwen-Image-2512-Lightning-8steps-V1.0-fp32'
+        # are common). Replace '.' and whitespace with '_'.
+        adapter_name = re.sub(r"[.\s]", "_", adapter_name)
 
         # Use weight_stage1 as the immediate effective weight (for non-UltraGen
         # single-pass generation).  UltraGen overrides per stage before each pipe() call.
@@ -138,7 +156,16 @@ class EricQwenImageApplyLoRA:
 
         print(f"[EricQwenImage] Applying LoRA: {lora_filename}")
         print(f"[EricQwenImage] Path: {lora_path}")
-        print(f"[EricQwenImage] Stage weights: S1={weight_stage1}, S2={weight_stage2}, S3={weight_stage3}")
+        print(f"[EricQwenImage] Stage weights: S1={weight_stage1}, S2={weight_stage2}, S3={weight_stage3}, keep_loaded={keep_loaded}")
+
+        # If keep_loaded=False, unload everything first for a clean state each run
+        if not keep_loaded:
+            try:
+                pipe.unload_lora_weights()
+                pipeline.pop("applied_loras", None)
+                print("[EricQwenImage] Unloaded previous LoRAs (keep_loaded=False)")
+            except Exception:
+                pass
 
         # Check if this adapter is already loaded
         loaded_adapters = set()
@@ -221,3 +248,76 @@ class EricQwenImageUnloadLoRA:
         pipeline.pop("applied_loras", None)
 
         return (pipeline,)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Diagnose LoRA
+# ═══════════════════════════════════════════════════════════════
+
+class EricQwenImageDiagnoseLoRA:
+    """
+    Diagnose LoRA compatibility with the Qwen-Image pipeline.
+
+    Loads the LoRA file and inspects its keys WITHOUT applying it,
+    then prints a compatibility report to the console and returns it
+    as a STRING.  Useful for understanding why a LoRA produces noise
+    or fails to load.
+
+    The report includes:
+    - Adapter type (LoRA / LoKR / LoHa / unknown)
+    - Rank and alpha values (for standard LoRA)
+    - How many adapter modules match the transformer architecture
+    - A COMPATIBLE / PARTIAL / INCOMPATIBLE verdict
+    """
+
+    CATEGORY = "Eric Qwen-Image"
+    FUNCTION = "diagnose"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("report",)
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipeline": ("QWEN_IMAGE_PIPELINE",),
+                "lora_name": (get_lora_list(), {
+                    "tooltip": "LoRA to analyze (inspected but NOT applied)"
+                }),
+            },
+            "optional": {
+                "lora_path_override": ("STRING", {
+                    "default": "",
+                    "tooltip": "Override with full path instead of dropdown"
+                }),
+            }
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def diagnose(
+        self,
+        pipeline: dict,
+        lora_name: str,
+        lora_path_override: str = "",
+    ) -> Tuple:
+        pipe = pipeline["pipeline"]
+        transformer = pipe.transformer
+
+        if lora_path_override and lora_path_override.strip():
+            lora_path = lora_path_override.strip()
+        else:
+            if lora_name == "none" or not lora_name:
+                return ("No LoRA selected.",)
+            lora_path = get_lora_full_path(lora_name)
+            if lora_path is None:
+                return (f"ERROR: LoRA file not found: {lora_name}",)
+
+        if not os.path.exists(lora_path):
+            return (f"ERROR: File not found: {lora_path}",)
+
+        report = _diagnose_lora_compatibility(lora_path, transformer)
+        print(report)
+        return (report,)

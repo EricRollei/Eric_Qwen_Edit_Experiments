@@ -19,6 +19,7 @@ import os
 import torch
 from typing import Tuple
 
+from .eric_qwen_edit_utils import patch_cosine_blend_vae
 from .eric_qwen_image_loader import (
     get_gen_pipeline_cache,
     clear_gen_pipeline_cache,
@@ -94,6 +95,17 @@ class EricQwenImageComponentLoader:
                     "default": False,
                     "tooltip": "Aggressive CPU offloading — very slow but handles huge images"
                 }),
+                "vae_tile_blend": (["cosine", "linear"], {
+                    "default": "cosine",
+                    "tooltip": (
+                        "Tile-seam blending for tiled VAE decode/encode.\n"
+                        "• cosine — C¹-smooth blend (zero slope at tile edges),\n"
+                        "  eliminates faint grid lines on smooth gradients.\n"
+                        "• linear — original diffusers behaviour. Slightly\n"
+                        "  sharper at tile edges; may show faint seams at\n"
+                        "  high resolutions."
+                    )
+                }),
             }
         }
 
@@ -135,6 +147,7 @@ class EricQwenImageComponentLoader:
         offload_vae: bool = False,
         attention_slicing: bool = False,
         sequential_offload: bool = False,
+        vae_tile_blend: str = "cosine",
     ) -> Tuple:
         from diffusers import QwenImagePipeline
 
@@ -234,7 +247,11 @@ class EricQwenImageComponentLoader:
                 pipeline.vae = pipeline.vae.to("cpu")
 
         pipeline.vae.enable_tiling()
-        print("[EricQwenImage] VAE tiling enabled")
+        if vae_tile_blend == "cosine":
+            patch_cosine_blend_vae(pipeline.vae)
+            print("[EricQwenImage] VAE tiling enabled (cosine blend)")
+        else:
+            print("[EricQwenImage] VAE tiling enabled (linear blend)")
 
         if attention_slicing:
             try:
